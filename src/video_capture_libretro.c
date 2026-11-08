@@ -45,6 +45,10 @@
 #define NO_FRAMES_TIMEOUT 2.0
 /* Seconds of uniformly black frames before showing the No Signal screen. */
 #define BLACK_TIMEOUT     1.0
+/* Seconds the last image is kept after the device reopens, before showing the
+ * No Signal screen. Avoids switching to the No Signal screen's size and back,
+ * which makes RetroArch rebuild its shaders twice. */
+#define REOPEN_HOLD       1.0
 /* Seconds between attempts to reopen a device that failed. */
 #define RETRY_INTERVAL    3.0
 
@@ -142,7 +146,8 @@ enum signal_state
    SIGNAL_NO_DEVICE,   /* No capture device found */
    SIGNAL_DEVICE_ERROR,/* The device could not be opened, or stopped with an error */
    SIGNAL_NO_FRAMES,   /* The device is open but sends no frames */
-   SIGNAL_BLACK        /* The device sends uniformly black frames: no input signal */
+   SIGNAL_BLACK,       /* The device sends uniformly black frames: no input signal */
+   SIGNAL_HOLD         /* The device just reopened: keep the last image until its first frame */
 };
 
 /* Capture */
@@ -150,6 +155,7 @@ static capture_frame_t last_frame;     /* Last frame received; valid while have_
 static bool            have_frame;
 static double          seconds_without_frame;
 static double          seconds_black;
+static bool            showing_capture; /* The last image sent is a captured frame */
 
 /* Output */
 static uint32_t       *rgb_buffer;      /* Converted or scaled image */
@@ -213,8 +219,9 @@ static double   rate_reported;        /* Rate reported to RetroArch */
 
 /* Phase adjustment for Lowest Latency (see phase_adjust_factor()). */
 #define ADJUST_EVENTS         6      /* Drops or repeats within ADJUST_WINDOW_RUNS that start an adjustment */
-#define ADJUST_WINDOW_RUNS    120
-#define ADJUST_FACTOR         1.005  /* RetroArch runs 0.5% faster: the timing shifts by about 5 ms per second */
+#define ADJUST_WINDOW_RUNS    120    /* About 2 seconds */
+#define ADJUST_MARGIN_MS      3.0    /* Average frame age this close to the collision zone starts an adjustment */
+#define ADJUST_FACTOR         1.005  /* RetroArch runs 0.5% faster or slower: the timing shifts by about 5 ms per second */
 #define ADJUST_SETTLED_FRAMES 5      /* Frames in a row halfway between two calls that end it */
 #define ADJUST_TIMEOUT_RUNS   600    /* Give up after about 10 seconds */
 #define ADJUST_COOLDOWN_RUNS  3600   /* Then wait about a minute before trying again */
@@ -224,6 +231,10 @@ static bool     adjusting;
 static uint64_t adjust_start_run;
 static uint64_t adjust_cooldown_until;
 static unsigned adjust_settled_frames;
+static double   adjust_factor;        /* ADJUST_FACTOR or its inverse, while adjusting */
+static double   adjust_age_sum_ms;    /* Frame ages over the current window */
+static unsigned adjust_age_count;
+static uint64_t total_runs;           /* retro_run() calls since the core started */
 
 /* Age of each frame when shown (time between its arrival from the device and
  * retro_run()), over the current stats second. */
@@ -492,19 +503,19 @@ static void declare_core_options(void)
             "Converts the device's YUV picture to the RGB format RetroArch needs. "
             "Core converts after downscaling, which is faster at 640x480 and 320x240, "
             "and applies the Color Space and Color Range options. "
-            "Media Foundation converts the full frame with Windows; Color Space and Color Range are then ignored. "
+            "Media Foundation converts the full frame with Windows; Color Space and Color Range are then hidden. "
             "Changing this option reopens the device.",
             "core", conversion_values);
 
       define_option(def++, "color", OPTION_COLOR_SPACE, "Color Space",
             "Color matrix used to convert YUV to RGB. Default uses Rec. 601 up to 576 lines and Rec. 709 above. "
-            "Applies only when Color Conversion is set to Core.",
+            "Shown only when Color Conversion is set to Core.",
             "default", color_space_values);
 
       define_option(def++, "color", OPTION_COLOR_RANGE, "Color Range",
             "Limited is standard for video: black is at level 16 and white at 235. "
             "Use Full if blacks look gray or colors look washed out. "
-            "Applies only when Color Conversion is set to Core.",
+            "Shown only when Color Conversion is set to Core.",
             "limited", color_range_values);
 
       define_option(def++, "diagnostics", OPTION_STATS, "Show Capture Stats",
@@ -587,24 +598,38 @@ static bool option_is(const char *value, const char *expected)
    return value && strcmp(value, expected) == 0;
 }
 
-/* Shows Log Capture Stats only when Show Capture Stats is on. Called by the
- * frontend when the options menu is displayed or an option changes; returns
- * true if the visibility changed. */
-static bool update_option_visibility(void)
+/* Shows or hides an option. `state` remembers the last visibility (-1 when
+ * unknown); returns true if it changed. */
+static bool set_option_visible(const char *key, bool visible, int *state)
 {
-   static int visible = -1; /* Unknown until the first call */
-   const char *stats = get_option(OPTION_STATS);
-   const bool show   = stats && !option_is(stats, "off");
    struct retro_core_option_display display;
 
-   if (visible == (int)show)
+   if (*state == (int)visible)
       return false;
 
-   display.key     = OPTION_STATS_LOG;
-   display.visible = show;
+   display.key     = key;
+   display.visible = visible;
    environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &display);
-   visible = show;
+   *state = visible;
    return true;
+}
+
+/* Shows Log Capture Stats only when Show Capture Stats is on, and Color Space
+ * and Color Range only when Color Conversion is set to Core (Media Foundation
+ * ignores them). Called by the frontend when the options menu is displayed or
+ * an option changes; returns true if a visibility changed. */
+static bool update_option_visibility(void)
+{
+   static int stats_log_state = -1, color_space_state = -1, color_range_state = -1;
+   const char *stats      = get_option(OPTION_STATS);
+   const bool show_log    = stats && !option_is(stats, "off");
+   const bool show_colors = !option_is(get_option(OPTION_CONVERSION), "media_foundation");
+   bool changed = false;
+
+   changed |= set_option_visible(OPTION_STATS_LOG, show_log, &stats_log_state);
+   changed |= set_option_visible(OPTION_COLOR_SPACE, show_colors, &color_space_state);
+   changed |= set_option_visible(OPTION_COLOR_RANGE, show_colors, &color_range_state);
+   return changed;
 }
 
 /* Last value of each option, to log changes in the stats log. */
@@ -775,6 +800,8 @@ static void apply_device_selection(bool force)
    adjusting             = false;
    adjust_events         = 0;
    adjust_cooldown_until = 0;
+   adjust_age_sum_ms     = 0.0;
+   adjust_age_count      = 0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -934,23 +961,28 @@ static void note_collision(uint64_t frames)
    if (opt_smooth_pacing || adjusting)
       return;
 
-   if (session_runs - adjust_window_start > ADJUST_WINDOW_RUNS)
+   if (total_runs - adjust_window_start > ADJUST_WINDOW_RUNS)
    {
-      adjust_window_start = session_runs;
+      adjust_window_start = total_runs;
       adjust_events       = 0;
    }
    adjust_events += (unsigned)frames;
 }
 
 /*
- * With Lowest Latency, gets out of the collision zone described in
+ * With Lowest Latency, keeps frames away from the collision zone described in
  * pick_frame(). When the device and RetroArch run at the same rate, frames
  * arriving right when RetroArch asks for one keep doing so for a long time,
- * and frames are dropped and repeated all along. When that happens, the core
- * reports a slightly higher rate (ADJUST_FACTOR); with a variable refresh
- * rate display, RetroArch follows it and its calls drift relative to the
- * frames. Once frames arrive halfway between two calls, the normal rate is
- * reported again.
+ * and frames are dropped and repeated all along.
+ *
+ * The adjustment starts when frames get close to that zone (their average age
+ * over ADJUST_WINDOW_RUNS frames is within ADJUST_MARGIN_MS of 0 or of the
+ * frame period), or when frames are already being dropped and repeated. The
+ * core then reports a rate slightly lower or higher (ADJUST_FACTOR), so that
+ * the timing moves away from the zone by the shorter way; with a variable
+ * refresh rate display, RetroArch follows it and its calls drift relative to
+ * the frames. Once frames arrive halfway between two calls, the normal rate
+ * is reported again.
  *
  * Returns the factor to apply to the reported rate. `age_ms` is the age of
  * the frame just shown.
@@ -967,15 +999,36 @@ static double phase_adjust_factor(double age_ms)
 
    if (!adjusting)
    {
-      if (adjust_events < ADJUST_EVENTS || session_runs < adjust_cooldown_until)
+      bool close = false;
+      double average_ms;
+
+      adjust_age_sum_ms += age_ms;
+      adjust_age_count++;
+      average_ms = adjust_age_sum_ms / adjust_age_count;
+
+      if (adjust_age_count >= ADJUST_WINDOW_RUNS)
+      {
+         close = average_ms < ADJUST_MARGIN_MS || average_ms > period_ms - ADJUST_MARGIN_MS;
+         adjust_age_sum_ms = 0.0;
+         adjust_age_count  = 0;
+      }
+
+      if ((!close && adjust_events < ADJUST_EVENTS) || total_runs < adjust_cooldown_until)
          return 1.0;
 
+      /* Frames arriving just before the calls (young): slow RetroArch down so
+       * its calls come later. Just after (old): speed it up. */
+      adjust_factor         = average_ms < period_ms / 2.0 ? 1.0 / ADJUST_FACTOR : ADJUST_FACTOR;
       adjusting             = true;
-      adjust_start_run      = session_runs;
+      adjust_start_run      = total_runs;
       adjust_settled_frames = 0;
       adjust_events         = 0;
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frames arrive right when RetroArch asks for one: shifting the timing.\n");
-      stats_log_printf("Frames arrive right when RetroArch asks for one: shifting the timing.");
+      adjust_age_sum_ms     = 0.0;
+      adjust_age_count      = 0;
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frames arrive close to when RetroArch asks for one "
+            "(average age %.1f ms): shifting the timing.\n", average_ms);
+      stats_log_printf("Frames arrive close to when RetroArch asks for one (average age %.1f ms): "
+            "shifting the timing.", average_ms);
    }
 
    if (age_ms >= period_ms * 0.35 && age_ms <= period_ms * 0.65)
@@ -984,25 +1037,25 @@ static double phase_adjust_factor(double age_ms)
       {
          adjusting = false;
          log_cb(RETRO_LOG_INFO, LOG_PREFIX "Timing shifted in %.1f s.\n",
-               (double)(session_runs - adjust_start_run) / rate_reported);
-         stats_log_printf("Timing shifted in %.1f s.", (double)(session_runs - adjust_start_run) / rate_reported);
+               (double)(total_runs - adjust_start_run) / rate_reported);
+         stats_log_printf("Timing shifted in %.1f s.", (double)(total_runs - adjust_start_run) / rate_reported);
          return 1.0;
       }
    }
    else
       adjust_settled_frames = 0;
 
-   if (session_runs - adjust_start_run > ADJUST_TIMEOUT_RUNS)
+   if (total_runs - adjust_start_run > ADJUST_TIMEOUT_RUNS)
    {
       adjusting             = false;
-      adjust_cooldown_until = session_runs + ADJUST_COOLDOWN_RUNS;
+      adjust_cooldown_until = total_runs + ADJUST_COOLDOWN_RUNS;
       log_cb(RETRO_LOG_WARN, LOG_PREFIX "Could not shift the timing: RetroArch does not follow the core's "
             "frame rate. This requires a variable refresh rate display with Sync to Exact Content Framerate.\n");
       stats_log_printf("Could not shift the timing: RetroArch does not follow the core's frame rate.");
       return 1.0;
    }
 
-   return ADJUST_FACTOR;
+   return adjust_factor;
 }
 
 /* Makes sure rgb_buffer holds at least `pixels` pixels. */
@@ -1449,6 +1502,7 @@ static void output_capture_frame(void)
 
    last_output       = out;
    last_output_pitch = pitch;
+   showing_capture   = true;
    video_cb(out, dst_width, dst_height, pitch);
 }
 
@@ -1458,6 +1512,7 @@ static void output_no_signal_screen(enum signal_state state)
    set_output_geometry(SCREEN_WIDTH, SCREEN_HEIGHT, 4.0f / 3.0f);
    last_output       = screen_buffer;
    last_output_pitch = SCREEN_WIDTH * sizeof(uint32_t);
+   showing_capture   = false;
    video_cb(screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT, last_output_pitch);
 }
 
@@ -1556,6 +1611,14 @@ static enum signal_state poll_capture(bool *new_frame)
 
    if (pick_frame(&frame))
    {
+      /* First frame since the device opened: the session starts here, so the
+       * time the device took to send it is not counted. */
+      if (!have_frame)
+      {
+         reset_session_stats();
+         session_paused_frames = capture_frames_received() - 1;
+      }
+
       last_frame            = frame;
       have_frame            = true;
       seconds_without_frame = 0.0;
@@ -1592,6 +1655,8 @@ static enum signal_state poll_capture(bool *new_frame)
       }
    }
 
+   if (!have_frame && showing_capture && can_dupe && seconds_without_frame < REOPEN_HOLD)
+      return SIGNAL_HOLD;
    if (!have_frame || seconds_without_frame >= NO_FRAMES_TIMEOUT)
       return SIGNAL_NO_FRAMES;
    if (seconds_black >= BLACK_TIMEOUT)
@@ -1603,6 +1668,12 @@ static void present_frame(bool options_changed)
 {
    bool new_frame;
    const enum signal_state state = poll_capture(&new_frame);
+
+   if (state == SIGNAL_HOLD)
+   {
+      video_cb(NULL, output_width, output_height, last_output_pitch); /* Repeat the last image */
+      return;
+   }
 
    if (state != SIGNAL_OK)
    {
@@ -1754,6 +1825,7 @@ RETRO_API void retro_run(void)
 
    detect_pause();
    session_runs++;
+   total_runs++;
 
    if (input_poll_cb)
       input_poll_cb();
