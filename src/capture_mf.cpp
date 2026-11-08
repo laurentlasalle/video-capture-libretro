@@ -181,6 +181,7 @@ static uint64_t              g_frame_sequence;
 static UINT32 g_out_width;
 static UINT32 g_out_height;
 static LONG   g_out_stride;
+static double g_out_frame_rate;
 static bool   g_warned_oversize;
 
 static std::atomic<bool> g_running(false);
@@ -188,14 +189,17 @@ static std::atomic<bool> g_running(false);
 static void update_output_format(IMFSourceReader *reader)
 {
    IMFMediaType *type = nullptr;
-   UINT32 width = 0, height = 0;
+   UINT32 width = 0, height = 0, rate_num = 0, rate_den = 0;
    LONG stride;
+   double frame_rate;
 
    if (FAILED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &type)))
       return;
 
    MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
-   stride = (LONG)MFGetAttributeUINT32(type, MF_MT_DEFAULT_STRIDE, width * 4);
+   MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &rate_num, &rate_den);
+   stride     = (LONG)MFGetAttributeUINT32(type, MF_MT_DEFAULT_STRIDE, width * 4);
+   frame_rate = rate_den ? (double)rate_num / rate_den : 0.0;
    safe_release(&type);
 
    {
@@ -203,11 +207,13 @@ static void update_output_format(IMFSourceReader *reader)
       g_out_width       = width;
       g_out_height      = height;
       g_out_stride      = stride;
+      g_out_frame_rate  = frame_rate;
       g_warned_oversize = false;
    }
 
-   log_message(CAPTURE_LOG_INFO, "Output format: %ux%u RGB32, stride %ld.",
-         (unsigned)width, (unsigned)height, (long)stride);
+   log_message(CAPTURE_LOG_INFO, "Output format: %ux%u RGB32 @ %.3f fps (%u/%u), stride %ld.",
+         (unsigned)width, (unsigned)height, frame_rate, (unsigned)rate_num, (unsigned)rate_den,
+         (long)stride);
 }
 
 static void copy_rows(const BYTE *scan0, LONG pitch, unsigned width, unsigned height)
@@ -700,6 +706,12 @@ extern "C" void capture_stop(void)
 extern "C" bool capture_is_running(void)
 {
    return g_running;
+}
+
+extern "C" double capture_get_frame_rate(void)
+{
+   std::lock_guard<std::mutex> lock(g_frame_mutex);
+   return g_out_frame_rate;
 }
 
 extern "C" bool capture_fetch_frame(uint32_t *dst, unsigned *width, unsigned *height, uint64_t *sequence)

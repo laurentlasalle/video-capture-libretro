@@ -50,6 +50,8 @@ Resolution and aspect ratio are independent: 640x480 with 16:9 gives an anamorph
 
 - The core picks the first capture device it finds. To choose another one, open **Quick Menu > Core Options > Capture Device**. Devices are detected when the core starts.
 - When no device is found, or no frame arrives for two seconds, the core shows a test pattern (color bars with a white line sweeping down once per second).
+- The core reports the device's real frame rate (for example 59.94 fps) to RetroArch, so frames are paced on the capture device. With a variable refresh rate display, enable **Settings > Video > Synchronization > Sync to Exact Content Framerate**.
+- The core keeps no frame queue: each `retro_run()` shows the most recent frame received.
 - The selected device format and any errors are written to RetroArch's log (**Settings > Logging**).
 - Close OBS or any other application using the device first: most capture devices can only be opened by one application at a time.
 

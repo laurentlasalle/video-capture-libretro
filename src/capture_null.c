@@ -35,6 +35,11 @@ bool capture_is_running(void)
    return false;
 }
 
+double capture_get_frame_rate(void)
+{
+   return 0.0;
+}
+
 bool capture_fetch_frame(uint32_t *dst, unsigned *width, unsigned *height, uint64_t *sequence)
 {
    (void)dst;

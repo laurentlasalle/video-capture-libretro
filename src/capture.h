@@ -56,6 +56,9 @@ void capture_stop(void);
 /* True while the device is open and has not reported an error. */
 bool capture_is_running(void);
 
+/* Frame rate of the current stream in frames per second, or 0 if unknown. */
+double capture_get_frame_rate(void);
+
 /* Copies the most recent frame into `dst` (XRGB8888, tightly packed, at most
  * CAPTURE_MAX_WIDTH x CAPTURE_MAX_HEIGHT) if it is newer than `*sequence`.
  * On success, updates `*width`, `*height` and `*sequence` and returns true. */

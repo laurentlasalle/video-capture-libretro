@@ -30,9 +30,9 @@
 
 #define PATTERN_WIDTH  640
 #define PATTERN_HEIGHT 480
-#define OUT_FPS        60.0
+#define DEFAULT_FPS    60.0
 #define SAMPLE_RATE    48000.0
-#define AUDIO_FRAMES   800 /* SAMPLE_RATE / OUT_FPS stereo frames per video frame */
+#define AUDIO_FRAMES_MAX 4800 /* Silence buffer: enough for frame rates down to 10 fps */
 
 /* Frames without a new capture frame before falling back to the test pattern. */
 #define SIGNAL_TIMEOUT_FRAMES 120
@@ -68,7 +68,8 @@ static retro_log_printf_t         log_cb;
 
 /* Test pattern */
 static uint32_t pattern_buffer[PATTERN_WIDTH * PATTERN_HEIGHT];
-static int16_t  silence[AUDIO_FRAMES * 2];
+static int16_t  silence[AUDIO_FRAMES_MAX * 2];
+static double   audio_frames_pending; /* Fractional audio frames carried between video frames */
 static uint64_t frame_count;
 
 /* Capture state */
@@ -92,6 +93,7 @@ static enum aspect_mode       aspect_option     = ASPECT_SOURCE;
 static unsigned output_width  = PATTERN_WIDTH;
 static unsigned output_height = PATTERN_HEIGHT;
 static float    output_aspect = 4.0f / 3.0f;
+static double   output_fps    = DEFAULT_FPS;
 
 /* Last frame sent, repeated when the device has no new frame yet */
 static const uint32_t *last_output;
@@ -144,7 +146,8 @@ static const uint32_t bar_colors[7] = {
 static void render_test_pattern(void)
 {
    const int bars_height = (PATTERN_HEIGHT * 2) / 3;
-   const int sweep_y     = (int)((frame_count % (uint64_t)OUT_FPS) * PATTERN_HEIGHT / (uint64_t)OUT_FPS);
+   const uint64_t fps    = (uint64_t)(output_fps + 0.5);
+   const int sweep_y     = (int)((frame_count % fps) * PATTERN_HEIGHT / fps);
    int x, y;
 
    for (y = 0; y < PATTERN_HEIGHT; y++)
@@ -405,6 +408,39 @@ static void set_output_geometry(unsigned width, unsigned height, float aspect)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
 }
 
+/* Returns the device frame rate, or the current one if unknown or implausible. */
+static double device_fps(void)
+{
+   double fps = capture_get_frame_rate();
+   return (fps >= 10.0 && fps <= 240.0) ? fps : output_fps;
+}
+
+/* Reports the device frame rate to the frontend when it changes, so RetroArch
+ * paces retro_run() on the capture device instead of a fixed 60 Hz. */
+static void update_frame_rate(void)
+{
+   struct retro_system_av_info av_info;
+   double fps = device_fps();
+
+   if (fps == output_fps)
+      return;
+
+   output_fps = fps;
+
+   memset(&av_info, 0, sizeof(av_info));
+   av_info.geometry.base_width   = output_width;
+   av_info.geometry.base_height  = output_height;
+   av_info.geometry.max_width    = CAPTURE_MAX_WIDTH;
+   av_info.geometry.max_height   = CAPTURE_MAX_HEIGHT;
+   av_info.geometry.aspect_ratio = output_aspect;
+   av_info.timing.fps            = output_fps;
+   av_info.timing.sample_rate    = SAMPLE_RATE;
+   environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frame rate: %.3f fps.\n", output_fps);
+}
+
 /* Applies the crop, resolution and aspect ratio options to a captured frame,
  * then sends it to the frontend. */
 static void output_capture_frame(void)
@@ -463,6 +499,7 @@ static void present_frame(void)
    {
       showing_capture        = true;
       frames_without_capture = 0;
+      update_frame_rate();
       output_capture_frame();
       return;
    }
@@ -556,7 +593,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.max_width    = CAPTURE_MAX_WIDTH;
    info->geometry.max_height   = CAPTURE_MAX_HEIGHT;
    info->geometry.aspect_ratio = output_aspect;
-   info->timing.fps            = OUT_FPS;
+   info->timing.fps            = output_fps;
    info->timing.sample_rate    = SAMPLE_RATE;
 }
 
@@ -593,8 +630,21 @@ RETRO_API void retro_run(void)
    else
       present_frame();
 
+   /* Silent audio matching the frame rate (800.8 frames per video frame at 59.94 fps). */
    if (audio_batch_cb)
-      audio_batch_cb(silence, AUDIO_FRAMES);
+   {
+      size_t frames;
+
+      audio_frames_pending += SAMPLE_RATE / output_fps;
+      frames = (size_t)audio_frames_pending;
+      if (frames > AUDIO_FRAMES_MAX)
+         frames = AUDIO_FRAMES_MAX;
+      audio_frames_pending -= (double)frames;
+      if (audio_frames_pending > AUDIO_FRAMES_MAX)
+         audio_frames_pending = 0.0;
+
+      audio_batch_cb(silence, frames);
+   }
 
    frame_count++;
 }
@@ -629,6 +679,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    capture_sequence    = 0;
    read_image_options();
    apply_device_selection(true);
+
+   /* retro_get_system_av_info() is called after this: report the device rate directly. */
+   output_fps = device_fps();
    return true;
 }
 
