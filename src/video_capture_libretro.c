@@ -781,12 +781,14 @@ static void describe_signal_state(enum signal_state state, char *reason, size_t 
       case SIGNAL_BLACK:
          snprintf(reason, reason_size, "The device is connected, but receives no picture from its source.");
          snprintf(hint, hint_size, "Check that the source is turned on, that its cable is plugged into "
-               "the input selected in Capture Device, and that its output resolution is supported.");
+               "the input selected in Capture Device, and that its output resolution is supported. "
+               "Another application, such as OBS, may also be using the device.");
          break;
       case SIGNAL_NO_FRAMES:
       default:
          snprintf(reason, reason_size, "The device is open, but sends no frames.");
-         snprintf(hint, hint_size, "Check the source and its cable. If the problem persists, "
+         snprintf(hint, hint_size, "Check the source and its cable. Another application, such as OBS, "
+               "may also be using the device. If the problem persists, "
                "try Color Conversion set to Media Foundation, or reconnect the device.");
          break;
    }
