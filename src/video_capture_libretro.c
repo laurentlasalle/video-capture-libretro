@@ -11,6 +11,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+/* fopen() is used for the temporary diagnostic file. */
+#define _CRT_SECURE_NO_WARNINGS
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -204,6 +207,50 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
    va_start(va, fmt);
    vfprintf(stderr, fmt, va);
    va_end(va);
+}
+
+/* TEMPORARY DIAGNOSTIC: core messages logged while content runs do not
+ * reach RetroArch's log file on the tester's machine. Diagnostic lines are
+ * therefore also written to video_capture_diag.log in RetroArch's save
+ * directory, flushed after each line. */
+static FILE *diag_file;
+
+static void diag_open(void)
+{
+   const char *dir = NULL;
+   char path[1024];
+
+   if (diag_file || !environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) || !dir)
+      return;
+
+   snprintf(path, sizeof(path), "%s%cvideo_capture_diag.log", dir,
+#ifdef _WIN32
+         '\\'
+#else
+         '/'
+#endif
+         );
+   diag_file = fopen(path, "w");
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] Diagnostic file: %s (%s).\n", path, diag_file ? "open" : "could not open");
+}
+
+static void diag_printf(const char *fmt, ...)
+{
+   char line[512];
+   va_list va;
+
+   va_start(va, fmt);
+   vsnprintf(line, sizeof(line), fmt, va);
+   va_end(va);
+
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "%s\n", line);
+   if (diag_file)
+   {
+      fprintf(diag_file, "%s\n", line);
+      fflush(diag_file);
+   }
 }
 
 /* Forwards backend messages to the frontend log. */
@@ -484,8 +531,8 @@ static void log_session_stats(void)
    double seconds;
 
    /* TEMPORARY DIAGNOSTIC: the summary does not appear in some logs. */
-   log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] Session stats check: now %lld, start %lld, received %llu, "
-         "shown %llu, runs %llu.\n", (long long)now, (long long)session_start_time,
+   diag_printf("[diag] Session stats check: now %lld, start %lld, received %llu, "
+         "shown %llu, runs %llu.", (long long)now, (long long)session_start_time,
          (unsigned long long)received, (unsigned long long)session_frames_shown,
          (unsigned long long)session_runs);
 
@@ -570,7 +617,7 @@ static void set_output_geometry(unsigned width, unsigned height, float aspect)
    geometry.aspect_ratio = aspect;
    environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 
-   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
+   diag_printf("Output: %ux%u, aspect ratio %.4f.", width, height, aspect);
 }
 
 /* Returns `fps` if plausible, otherwise the current output rate. */
@@ -688,8 +735,8 @@ static void update_stats(void)
    /* TEMPORARY DIAGNOSTIC: one log line per second while stats are shown. */
    {
       const uint64_t received_delta = received - stats_last_received;
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] t=%us capture %.2f RetroArch %.2f output %.2f fps | "
-            "not shown %llu, repeated %llu | frame age min %.1f avg %.1f max %.1f ms\n",
+      diag_printf("[diag] t=%us capture %.2f RetroArch %.2f output %.2f fps | "
+            "not shown %llu, repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
             ++diag_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
             (unsigned long long)(received_delta > stats_frames_shown ? received_delta - stats_frames_shown : 0),
             (unsigned long long)(stats_runs > stats_frames_shown ? stats_runs - stats_frames_shown : 0),
@@ -698,6 +745,10 @@ static void update_stats(void)
             diag_age_count ? diag_age_max_ms : 0.0);
       diag_age_sum_ms = 0.0;
       diag_age_count  = 0;
+
+      /* Is a level filter dropping runtime messages? */
+      if (diag_seconds % 10 == 1)
+         log_cb(RETRO_LOG_ERROR, LOG_PREFIX "[diag] Error-level test message at t=%us.\n", diag_seconds);
    }
 
    stats_capture_fps   = (double)(received - stats_last_received) / seconds;
@@ -1152,6 +1203,12 @@ RETRO_API void retro_init(void)
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
+   if (diag_file)
+   {
+      diag_printf("[diag] Core deinitialized.");
+      fclose(diag_file);
+      diag_file = NULL;
+   }
    free(rgb_buffer);
    rgb_buffer      = NULL;
    rgb_buffer_size = 0;
@@ -1242,6 +1299,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    if (!environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &message_interface_version))
       message_interface_version = 0;
 
+   diag_open();
+
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Core started (version %s).\n", CORE_VERSION);
    if (game && game->path)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Content: %s\n", game->path);
@@ -1265,6 +1324,7 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
+   diag_printf("[diag] retro_unload_game() called.");
    log_session_stats();
    capture_stop();
    active_device_id[0] = '\0';
