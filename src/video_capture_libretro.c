@@ -171,6 +171,8 @@ static retro_time_t stats_last_time;
 static uint64_t     stats_last_received;
 static uint64_t     stats_frames_shown;  /* New frames shown since stats_last_time */
 static uint64_t     stats_runs;          /* retro_run() calls since stats_last_time */
+static uint64_t     stats_dropped;       /* Frames skipped (never shown) since stats_last_time */
+static uint64_t     stats_repeated;      /* Calls that repeated the previous frame */
 static double       stats_capture_fps;   /* Frames received from the device per second */
 static double       stats_frontend_fps;  /* retro_run() calls per second */
 static double       stats_output_fps;    /* New frames shown per second */
@@ -179,6 +181,18 @@ static double       stats_output_fps;    /* New frames shown per second */
 static retro_time_t session_start_time;
 static uint64_t     session_frames_shown;
 static uint64_t     session_runs;
+static uint64_t     session_dropped;
+static uint64_t     session_pacing_skips;
+static uint64_t     session_repeated;
+static retro_time_t session_paused_usec;   /* Time RetroArch did not run the core (menu) */
+static uint64_t     session_paused_frames; /* Frames received during those pauses */
+
+/* Pause detection: RetroArch stops calling retro_run() while its menu is
+ * open. Frames missed meanwhile are not counted as drops. */
+#define PAUSE_THRESHOLD_USEC 500000
+static retro_time_t last_run_usec;
+static uint64_t     last_run_received;
+static bool         pacing_resync; /* Show the newest frame next, without counting drops */
 
 /* Age of each frame when shown (time between its arrival from the device and
  * retro_run()), over the current stats second. */
@@ -271,6 +285,7 @@ static void update_stats_log_file(void)
 #endif
          );
    stats_log_file = fopen(path, "w");
+   stats_seconds  = 0;
    log_cb(stats_log_file ? RETRO_LOG_INFO : RETRO_LOG_WARN, LOG_PREFIX "Capture stats log: %s (%s).\n",
          path, stats_log_file ? "open" : "could not open");
    stats_log_printf("Video Capture Device %s, frame pacing: %s.", CORE_VERSION,
@@ -606,33 +621,39 @@ static int selected_device_index(void)
 static void log_session_stats(void)
 {
    const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
-   const uint64_t received = capture_frames_received();
-   double seconds;
+   const uint64_t received = capture_frames_received() - session_paused_frames;
+   double seconds, paused;
 
    if (!now || !session_start_time || !received)
       return;
 
-   seconds = (double)(now - session_start_time) / 1000000.0;
+   paused  = (double)session_paused_usec / 1000000.0;
+   seconds = (double)(now - session_start_time) / 1000000.0 - paused;
    if (seconds < 1.0)
       return;
 
-   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Session stats over %.0f s: capture %.2f fps, RetroArch %.2f fps, "
-         "output %.2f fps; %llu of %llu frames not shown.\n",
-         seconds, received / seconds, session_runs / seconds, session_frames_shown / seconds,
-         (unsigned long long)(received > session_frames_shown ? received - session_frames_shown : 0),
-         (unsigned long long)received);
-   stats_log_printf("Session over %.0f s: capture %.2f fps, RetroArch %.2f fps, output %.2f fps; "
-         "%llu of %llu frames not shown.",
-         seconds, received / seconds, session_runs / seconds, session_frames_shown / seconds,
-         (unsigned long long)(received > session_frames_shown ? received - session_frames_shown : 0),
-         (unsigned long long)received);
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Session stats over %.0f s (plus %.0f s paused): capture %.2f fps, "
+         "RetroArch %.2f fps, output %.2f fps; %llu frames dropped (%llu by pacing), %llu repeated.\n",
+         seconds, paused, received / seconds, session_runs / seconds, session_frames_shown / seconds,
+         (unsigned long long)session_dropped, (unsigned long long)session_pacing_skips,
+         (unsigned long long)session_repeated);
+   stats_log_printf("Session over %.0f s (plus %.0f s paused): capture %.2f fps, RetroArch %.2f fps, "
+         "output %.2f fps; %llu frames dropped (%llu by pacing), %llu repeated.",
+         seconds, paused, received / seconds, session_runs / seconds, session_frames_shown / seconds,
+         (unsigned long long)session_dropped, (unsigned long long)session_pacing_skips,
+         (unsigned long long)session_repeated);
 }
 
 static void reset_session_stats(void)
 {
    session_start_time   = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
-   session_frames_shown = 0;
-   session_runs         = 0;
+   session_frames_shown  = 0;
+   session_runs          = 0;
+   session_dropped       = 0;
+   session_pacing_skips  = 0;
+   session_repeated      = 0;
+   session_paused_usec   = 0;
+   session_paused_frames = 0;
 }
 
 /* Opens the selected device. Without `force`, does nothing if the device and
@@ -662,8 +683,10 @@ static void apply_device_selection(bool force)
 
    log_session_stats();
    reset_session_stats();
-   shown_sequence   = 0;
-   pacing_safe_runs = 0;
+   shown_sequence    = 0;
+   pacing_safe_runs  = 0;
+   pacing_resync     = false;
+   last_run_usec     = 0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -806,6 +829,11 @@ static void update_stats(void)
       stats_last_received = received;
       stats_frames_shown  = 0;
       stats_runs          = 0;
+      stats_dropped       = 0;
+      stats_repeated      = 0;
+      stats_pacing_skips  = 0;
+      frame_age_count     = 0;
+      frame_age_sum_ms    = 0.0;
       return;
    }
 
@@ -818,18 +846,20 @@ static void update_stats(void)
       const uint64_t received_delta = received - stats_last_received;
 
       stats_seconds++;
-      stats_log_printf("t=%us capture %.2f RetroArch %.2f output %.2f fps | not shown %llu "
+      stats_log_printf("t=%us capture %.2f RetroArch %.2f output %.2f fps | dropped %llu "
             "(pacing skips %llu), repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
             stats_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
-            (unsigned long long)(received_delta > stats_frames_shown ? received_delta - stats_frames_shown : 0),
+            (unsigned long long)stats_dropped,
             (unsigned long long)stats_pacing_skips,
-            (unsigned long long)(stats_runs > stats_frames_shown ? stats_runs - stats_frames_shown : 0),
+            (unsigned long long)stats_repeated,
             frame_age_count ? frame_age_min_ms : 0.0,
             frame_age_count ? frame_age_sum_ms / frame_age_count : 0.0,
             frame_age_count ? frame_age_max_ms : 0.0);
       frame_age_sum_ms   = 0.0;
       frame_age_count    = 0;
       stats_pacing_skips = 0;
+      stats_dropped      = 0;
+      stats_repeated     = 0;
    }
 
    stats_capture_fps   = (double)(received - stats_last_received) / seconds;
@@ -1194,7 +1224,7 @@ static bool pick_frame(capture_frame_t *frame)
 
    pick = newest;
 
-   if (opt_smooth_pacing && shown_sequence)
+   if (opt_smooth_pacing && shown_sequence && !pacing_resync)
    {
       const uint64_t backlog   = newest - shown_sequence; /* New frames available */
       const double period_ms   = 1000.0 / output_fps;
@@ -1206,8 +1236,9 @@ static bool pick_frame(capture_frame_t *frame)
 
       if (backlog >= 3 || pacing_safe_runs >= PACING_SKIP_RUNS)
       {
-         stats_pacing_skips += backlog - 1;
-         pacing_safe_runs    = 0;
+         stats_pacing_skips   += backlog - 1;
+         session_pacing_skips += backlog - 1;
+         pacing_safe_runs      = 0;
       }
       else
       {
@@ -1220,7 +1251,16 @@ static bool pick_frame(capture_frame_t *frame)
    if (!capture_acquire_frame(pick, frame))
       return false;
 
+   /* Frames between the last one shown and this one are never shown. After a
+    * device start or a pause, missed frames are not drops. */
+   if (shown_sequence && !pacing_resync && pick > shown_sequence + 1)
+   {
+      stats_dropped   += pick - shown_sequence - 1;
+      session_dropped += pick - shown_sequence - 1;
+   }
+
    shown_sequence = pick;
+   pacing_resync  = false;
    return true;
 }
 
@@ -1266,7 +1306,14 @@ static enum signal_state poll_capture(bool *new_frame)
       update_frame_rate(frame.frame_rate);
    }
    else
+   {
       seconds_without_frame += frame_time;
+      if (have_frame)
+      {
+         stats_repeated++;
+         session_repeated++;
+      }
+   }
 
    if (!have_frame || seconds_without_frame >= NO_FRAMES_TIMEOUT)
       return SIGNAL_NO_FRAMES;
@@ -1388,11 +1435,38 @@ RETRO_API void retro_reset(void)
    apply_device_selection(true);
 }
 
+/* Detects pauses (RetroArch's menu) from the time since the previous call.
+ * A pause restarts the current stats second, excludes the pause from the
+ * session summary, and makes the core resume on the newest frame. */
+static void detect_pause(void)
+{
+   const retro_time_t now  = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const uint64_t received = capture_frames_received();
+
+   if (!now)
+      return;
+
+   if (last_run_usec && now - last_run_usec > PAUSE_THRESHOLD_USEC)
+   {
+      const retro_time_t gap = now - last_run_usec;
+
+      session_paused_usec   += gap;
+      session_paused_frames += received >= last_run_received ? received - last_run_received : 0;
+      stats_last_time        = 0; /* Restart the stats second */
+      pacing_resync          = true;
+      stats_log_printf("Paused for %.1f s.", (double)gap / 1000000.0);
+   }
+
+   last_run_usec     = now;
+   last_run_received = received;
+}
+
 RETRO_API void retro_run(void)
 {
    bool updated = false;
 
    session_runs++;
+   detect_pause();
 
    if (input_poll_cb)
       input_poll_cb();

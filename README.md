@@ -69,7 +69,7 @@ The display's refresh rate decides whether every captured frame is shown. Captur
 
 Even with matching rates, the capture device and RetroArch run on separate clocks: the moment a frame arrives slowly drifts relative to the moment RetroArch asks for one. Every few seconds to a few minutes, depending on the clocks, the two meet. With **Frame Pacing** set to **Smooth** (the default), the core absorbs this with at most one frame of extra latency and a single skipped frame; with **Lowest Latency**, frames are dropped and repeated for a few seconds.
 
-Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. With **Log Capture Stats**, the rates and the age of each frame when shown are written every second to `video_capture_stats.log`, followed by a session summary when the core closes. RetroArch 1.16 does not keep core messages in its own log once content is running, hence the separate file.
+Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. With **Log Capture Stats**, the rates, the frames dropped and repeated, and the age of each frame when shown are written every second to `video_capture_stats.log`, followed by a session summary when the core closes. Pauses (RetroArch's menu) are noted in the file and excluded from the measurements. RetroArch 1.16 does not keep core messages in its own log once content is running, hence the separate file.
 
 ## Troubleshooting
 
