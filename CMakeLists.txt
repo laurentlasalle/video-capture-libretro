@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(video_capture_libretro VERSION 0.3.2 LANGUAGES C CXX)
+project(video_capture_libretro VERSION 0.3.3 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -24,7 +24,10 @@ set(CORE_SOURCES
 )
 
 if(WIN32)
-  list(APPEND CORE_SOURCES src/capture_mf.cpp)
+  # Version information resource (file Properties > Details).
+  enable_language(RC)
+  configure_file(src/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/version.rc @ONLY)
+  list(APPEND CORE_SOURCES src/capture_mf.cpp ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
 else()
   # No native capture backend yet: the core shows its test pattern only.
   list(APPEND CORE_SOURCES src/capture_null.c)
