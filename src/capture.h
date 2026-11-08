@@ -61,6 +61,7 @@ typedef struct capture_frame
    unsigned            width;
    unsigned            height;
    double              frame_rate; /* Frames per second, or 0 if unknown */
+   int64_t             arrival_usec; /* When the frame arrived, on the capture_time_usec() clock */
 } capture_frame_t;
 
 /* Sets the function used by the backend to report messages. */
@@ -88,6 +89,9 @@ const char *capture_last_error(void);
 /* Frame rate of the current stream in frames per second, or 0 if unknown.
  * Known as soon as capture_start() succeeds, before the first frame. */
 double capture_get_frame_rate(void);
+
+/* Current time in microseconds, on the clock used for frame arrival times. */
+int64_t capture_time_usec(void);
 
 /* Number of frames received from the device since capture_start(),
  * including frames the core never picked up. Used for statistics. */

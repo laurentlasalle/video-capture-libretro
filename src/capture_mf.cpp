@@ -242,6 +242,7 @@ struct frame_slot
    enum capture_format  format = CAPTURE_FORMAT_XRGB8888;
    unsigned             width  = 0;
    unsigned             height = 0;
+   int64_t              arrival_usec = 0;
 };
 
 static frame_slot  g_slots[3];
@@ -323,8 +324,21 @@ static void copy_plane(uint8_t *dst, const BYTE *src, LONG pitch, size_t row_byt
 /* Copies a locked image into the write slot, then publishes it.
  * `buffer_len` is the size of the locked buffer, used to find the NV12 chroma
  * plane when the driver pads the luma plane. */
+/* Microseconds from the high-resolution performance counter. */
+static int64_t qpc_usec(void)
+{
+   static LARGE_INTEGER frequency;
+   LARGE_INTEGER now;
+
+   if (!frequency.QuadPart)
+      QueryPerformanceFrequency(&frequency);
+   QueryPerformanceCounter(&now);
+   return (int64_t)(now.QuadPart / frequency.QuadPart * 1000000 +
+         now.QuadPart % frequency.QuadPart * 1000000 / frequency.QuadPart);
+}
+
 static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
-      enum capture_format format, unsigned width, unsigned height)
+      enum capture_format format, unsigned width, unsigned height, int64_t arrival_usec)
 {
    frame_slot *slot = g_write_slot; /* Only this thread touches the write slot */
    const size_t bytes_per_pixel = format == CAPTURE_FORMAT_XRGB8888 ? 4 : (format == CAPTURE_FORMAT_YUY2 ? 2 : 1);
@@ -352,7 +366,8 @@ static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
       copy_plane(slot->data.data(), scan0, pitch, row_bytes, height);
    }
 
-   slot->stride = row_bytes;
+   slot->stride       = row_bytes;
+   slot->arrival_usec = arrival_usec;
    slot->format = format;
    slot->width  = width;
    slot->height = height;
@@ -363,7 +378,7 @@ static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
    g_ready_is_new = true;
 }
 
-static void store_sample(IMFSample *sample)
+static void store_sample(IMFSample *sample, int64_t arrival_usec)
 {
    IMFMediaBuffer *buffer = nullptr;
    IMF2DBuffer *buffer2d  = nullptr;
@@ -418,7 +433,7 @@ static void store_sample(IMFSample *sample)
          {
             const size_t abs_pitch = (size_t)(pitch < 0 ? -pitch : pitch);
             if (abs_pitch >= width * bytes_per_pixel)
-               copy_to_write_slot(scan0, pitch, len ? len : abs_pitch * rows, format, width, height);
+               copy_to_write_slot(scan0, pitch, len ? len : abs_pitch * rows, format, width, height, arrival_usec);
             buffer2d->Unlock2D();
          }
          safe_release(&buffer2d);
@@ -430,7 +445,7 @@ static void store_sample(IMFSample *sample)
          const BYTE *scan0      = pitch < 0 ? data + abs_pitch * (height - 1) : data;
 
          if (abs_pitch >= width * bytes_per_pixel && (size_t)cur_len >= abs_pitch * rows)
-            copy_to_write_slot(scan0, pitch, cur_len, format, width, height);
+            copy_to_write_slot(scan0, pitch, cur_len, format, width, height, arrival_usec);
          buffer->Unlock();
       }
    }
@@ -507,6 +522,8 @@ public:
    STDMETHODIMP OnReadSample(HRESULT status, DWORD stream_index, DWORD flags,
          LONGLONG timestamp, IMFSample *sample) override
    {
+      const int64_t arrival_usec = qpc_usec(); /* Before any processing */
+
       (void)stream_index;
       (void)timestamp;
 
@@ -538,7 +555,7 @@ public:
       }
 
       if (sample)
-         store_sample(sample);
+         store_sample(sample, arrival_usec);
 
       /* Request the next frame, unless capture_stop() is in progress. The lock
        * keeps the reader alive for the duration of the request. */
@@ -979,6 +996,11 @@ extern "C" double capture_get_frame_rate(void)
    return g_out_frame_rate;
 }
 
+extern "C" int64_t capture_time_usec(void)
+{
+   return qpc_usec();
+}
+
 extern "C" uint64_t capture_frames_received(void)
 {
    return g_frames_received;
@@ -999,6 +1021,7 @@ extern "C" bool capture_acquire_frame(capture_frame_t *frame)
    frame->format     = g_read_slot->format;
    frame->width      = g_read_slot->width;
    frame->height     = g_read_slot->height;
-   frame->frame_rate = capture_get_frame_rate();
+   frame->frame_rate   = capture_get_frame_rate();
+   frame->arrival_usec = g_read_slot->arrival_usec;
    return true;
 }

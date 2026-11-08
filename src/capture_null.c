@@ -46,6 +46,11 @@ double capture_get_frame_rate(void)
    return 0.0;
 }
 
+int64_t capture_time_usec(void)
+{
+   return 0;
+}
+
 uint64_t capture_frames_received(void)
 {
    return 0;

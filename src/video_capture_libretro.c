@@ -166,6 +166,16 @@ static retro_time_t session_start_time;
 static uint64_t     session_frames_shown;
 static uint64_t     session_runs;
 
+/* TEMPORARY DIAGNOSTIC: age of each frame when the core picks it up (time
+ * between its arrival from the device and retro_run()), over the current
+ * stats second. Logged with the rates to study frame pacing; remove once
+ * the periodic frame drops are understood. */
+static double   diag_age_min_ms;
+static double   diag_age_max_ms;
+static double   diag_age_sum_ms;
+static unsigned diag_age_count;
+static unsigned diag_seconds;
+
 #define STATS_LINES 3
 static char         stats_lines[STATS_LINES][96];
 static uint32_t     stats_colors[STATS_LINES];
@@ -473,6 +483,12 @@ static void log_session_stats(void)
    const uint64_t received = capture_frames_received();
    double seconds;
 
+   /* TEMPORARY DIAGNOSTIC: the summary does not appear in some logs. */
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] Session stats check: now %lld, start %lld, received %llu, "
+         "shown %llu, runs %llu.\n", (long long)now, (long long)session_start_time,
+         (unsigned long long)received, (unsigned long long)session_frames_shown,
+         (unsigned long long)session_runs);
+
    if (!now || !session_start_time || !received)
       return;
 
@@ -668,6 +684,21 @@ static void update_stats(void)
    seconds = (double)(now - stats_last_time) / 1000000.0;
    if (seconds < 1.0)
       return;
+
+   /* TEMPORARY DIAGNOSTIC: one log line per second while stats are shown. */
+   {
+      const uint64_t received_delta = received - stats_last_received;
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] t=%us capture %.2f RetroArch %.2f output %.2f fps | "
+            "not shown %llu, repeated %llu | frame age min %.1f avg %.1f max %.1f ms\n",
+            ++diag_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
+            (unsigned long long)(received_delta > stats_frames_shown ? received_delta - stats_frames_shown : 0),
+            (unsigned long long)(stats_runs > stats_frames_shown ? stats_runs - stats_frames_shown : 0),
+            diag_age_count ? diag_age_min_ms : 0.0,
+            diag_age_count ? diag_age_sum_ms / diag_age_count : 0.0,
+            diag_age_count ? diag_age_max_ms : 0.0);
+      diag_age_sum_ms = 0.0;
+      diag_age_count  = 0;
+   }
 
    stats_capture_fps   = (double)(received - stats_last_received) / seconds;
    stats_frontend_fps  = (double)stats_runs / seconds;
@@ -1029,6 +1060,15 @@ static enum signal_state poll_capture(bool *new_frame)
       seconds_black         = convert_frame_is_black(&frame) ? seconds_black + frame_time : 0.0;
       stats_frames_shown++;
       session_frames_shown++;
+
+      if (frame.arrival_usec)
+      {
+         const double age_ms = (double)(capture_time_usec() - frame.arrival_usec) / 1000.0;
+         if (!diag_age_count || age_ms < diag_age_min_ms) diag_age_min_ms = age_ms;
+         if (!diag_age_count || age_ms > diag_age_max_ms) diag_age_max_ms = age_ms;
+         diag_age_sum_ms += age_ms;
+         diag_age_count++;
+      }
       *new_frame = true;
       update_frame_rate(frame.frame_rate);
    }
