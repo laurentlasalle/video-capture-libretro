@@ -161,6 +161,11 @@ static double       stats_capture_fps;   /* Frames received from the device per 
 static double       stats_frontend_fps;  /* retro_run() calls per second */
 static double       stats_output_fps;    /* New frames shown per second */
 
+/* Session totals since the device was opened, logged when it is closed. */
+static retro_time_t session_start_time;
+static uint64_t     session_frames_shown;
+static uint64_t     session_runs;
+
 #define STATS_LINES 3
 static char         stats_lines[STATS_LINES][96];
 static uint32_t     stats_colors[STATS_LINES];
@@ -459,6 +464,36 @@ static int selected_device_index(void)
    return 0;
 }
 
+/* Logs a summary of the capture session: average rates and frames lost.
+ * Called when the device is closed, so the log keeps a trace of dropped
+ * frames without watching the on-screen stats. */
+static void log_session_stats(void)
+{
+   const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const uint64_t received = capture_frames_received();
+   double seconds;
+
+   if (!now || !session_start_time || !received)
+      return;
+
+   seconds = (double)(now - session_start_time) / 1000000.0;
+   if (seconds < 1.0)
+      return;
+
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Session stats over %.0f s: capture %.2f fps, RetroArch %.2f fps, "
+         "output %.2f fps; %llu of %llu frames not shown.\n",
+         seconds, received / seconds, session_runs / seconds, session_frames_shown / seconds,
+         (unsigned long long)(received > session_frames_shown ? received - session_frames_shown : 0),
+         (unsigned long long)received);
+}
+
+static void reset_session_stats(void)
+{
+   session_start_time   = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   session_frames_shown = 0;
+   session_runs         = 0;
+}
+
 /* Opens the selected device. Without `force`, does nothing if the device and
  * conversion mode are unchanged. */
 static void apply_device_selection(bool force)
@@ -483,6 +518,9 @@ static void apply_device_selection(bool force)
    seconds_without_frame = 0.0;
    seconds_black         = 0.0;
    retry_timer           = RETRY_INTERVAL;
+
+   log_session_stats();
+   reset_session_stats();
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -990,6 +1028,7 @@ static enum signal_state poll_capture(bool *new_frame)
       seconds_without_frame = 0.0;
       seconds_black         = convert_frame_is_black(&frame) ? seconds_black + frame_time : 0.0;
       stats_frames_shown++;
+      session_frames_shown++;
       *new_frame = true;
       update_frame_rate(frame.frame_rate);
    }
@@ -1115,6 +1154,8 @@ RETRO_API void retro_run(void)
 {
    bool updated = false;
 
+   session_runs++;
+
    if (input_poll_cb)
       input_poll_cb();
 
@@ -1184,6 +1225,7 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
+   log_session_stats();
    capture_stop();
    active_device_id[0] = '\0';
    have_frame          = false;

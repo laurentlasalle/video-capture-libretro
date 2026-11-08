@@ -58,7 +58,14 @@ Next time the file is loaded, its options and shader preset come back automatica
 ## Latency and frame pacing
 
 - The core keeps no frame queue: each `retro_run()` shows the most recent frame received, and older frames are dropped.
-- The core reports the device's real frame rate (for example 59.94 fps) to RetroArch, so frames are paced on the capture device. With a variable refresh rate display, enable **Settings > Video > Synchronization > Sync to Exact Content Framerate**.
+- The core reports the device's real frame rate (for example 59.94 fps) to RetroArch, so RetroArch paces the core on the capture device.
+
+The display's refresh rate decides whether every captured frame is shown. Capture devices usually run at 59.94 fps, which no fixed refresh rate divides evenly: at 120 Hz with **VSync Swap Interval** set to 2, RetroArch shows exactly 60 fps and has to skip a frame regularly to stay in sync; without VSync, RetroArch's timing is uneven and many frames are lost. In order of preference:
+
+1. **Variable refresh rate display (G-Sync, FreeSync)**: enable **Settings > Video > Synchronization > Sync to Exact Content Framerate**. The display follows the capture device exactly and no frame is lost.
+2. **Fixed refresh rate display**: set the display to 59.94 Hz or 60 Hz in Windows, and keep **VSync** on in RetroArch with **VSync Swap Interval** at 1. A frame may still be dropped or repeated occasionally, since the display and the capture device have separate clocks.
+
+Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. When the core closes, a summary of the session (average rates and frames not shown) is written to the log.
 
 ## Troubleshooting
 
