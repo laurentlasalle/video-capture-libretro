@@ -19,6 +19,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Show version information
+        shell: pwsh
+        run: (Get-Item build/Release/video_capture_libretro.dll).VersionInfo | Format-List CompanyName, FileDescription, FileVersion, ProductName, LegalCopyright
+
       - name: Package
         shell: pwsh
         run: |
