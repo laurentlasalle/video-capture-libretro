@@ -108,7 +108,7 @@ static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
 static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
 static enum stats_mode         opt_stats       = STATS_OFF;
 static bool                    opt_details     = false;
-static bool                    opt_smooth_pacing = false;
+static bool                    opt_smooth_pacing = true;
 static bool                    opt_stats_log   = false;
 
 /* ------------------------------------------------------------------------ */
@@ -210,6 +210,20 @@ static uint64_t rate_last_sequence;
 static int64_t  rate_last_usec;
 static double   rate_nominal;         /* Rate declared by the device */
 static double   rate_reported;        /* Rate reported to RetroArch */
+
+/* Phase adjustment for Lowest Latency (see phase_adjust_factor()). */
+#define ADJUST_EVENTS         6      /* Drops or repeats within ADJUST_WINDOW_RUNS that start an adjustment */
+#define ADJUST_WINDOW_RUNS    120
+#define ADJUST_FACTOR         1.005  /* RetroArch runs 0.5% faster: the timing shifts by about 5 ms per second */
+#define ADJUST_SETTLED_FRAMES 5      /* Frames in a row halfway between two calls that end it */
+#define ADJUST_TIMEOUT_RUNS   600    /* Give up after about 10 seconds */
+#define ADJUST_COOLDOWN_RUNS  3600   /* Then wait about a minute before trying again */
+static uint64_t adjust_window_start;  /* retro_run() count when the event window started */
+static unsigned adjust_events;
+static bool     adjusting;
+static uint64_t adjust_start_run;
+static uint64_t adjust_cooldown_until;
+static unsigned adjust_settled_frames;
 
 /* Age of each frame when shown (time between its arrival from the device and
  * retro_run()), over the current stats second. */
@@ -403,7 +417,7 @@ static const char *const details_values[] = {
    "off", "Off", "on", "On", NULL
 };
 static const char *const pacing_values[] = {
-   "latest", "Lowest Latency", "smooth", "Smooth", NULL
+   "smooth", "Smooth", "latest", "Lowest Latency", NULL
 };
 static const char *const stats_log_values[] = {
    "off", "Off", "on", "On", NULL
@@ -465,13 +479,14 @@ static void declare_core_options(void)
             "source", aspect_values);
 
       define_option(def++, "video", OPTION_PACING, "Frame Pacing",
-            "Lowest Latency always shows the newest frame. The core measures the device's real frame rate "
-            "and reports it to RetroArch, so with a variable refresh rate display or Sync to Exact Content "
-            "Framerate, frames arrive at a steady moment and none is lost. "
-            "Smooth shows every frame in order, at the cost of up to one frame of latency (about 16 ms), "
-            "and skips a single frame now and then to catch up. Use it if Show Capture Stats reports "
-            "frames dropped and repeated in bursts, for example with a device whose timing is irregular.",
-            "latest", pacing_values);
+            "The capture device and RetroArch run on separate clocks, so frames sometimes arrive "
+            "right when RetroArch asks for one. "
+            "Smooth shows every frame in order: at those moments only, it adds up to one frame of latency "
+            "(about 16 ms), and skips a single frame afterwards to catch up. Recommended to watch video. "
+            "Lowest Latency always shows the newest frame. At those moments, frames are dropped and repeated "
+            "until the core shifts the timing, which takes a few seconds and requires a variable refresh rate "
+            "display with Sync to Exact Content Framerate. Recommended to play games through the capture device.",
+            "smooth", pacing_values);
 
       define_option(def++, "color", OPTION_CONVERSION, "Color Conversion",
             "Converts the device's YUV picture to the RGB format RetroArch needs. "
@@ -546,7 +561,7 @@ static void declare_core_options(void)
       legacy_variables[7].key   = OPTION_DETAILS;
       legacy_variables[7].value = "No Signal Details; off|on";
       legacy_variables[8].key   = OPTION_PACING;
-      legacy_variables[8].value = "Frame Pacing; latest|smooth";
+      legacy_variables[8].value = "Frame Pacing; smooth|latest";
       legacy_variables[9].key   = OPTION_STATS_LOG;
       legacy_variables[9].value = "Log Capture Stats; off|on";
       legacy_variables[10].key   = NULL;
@@ -656,7 +671,7 @@ static void read_options(void)
              : STATS_OFF;
 
    opt_details       = option_is(get_option(OPTION_DETAILS), "on");
-   opt_smooth_pacing = option_is(get_option(OPTION_PACING), "smooth");
+   opt_smooth_pacing = !option_is(get_option(OPTION_PACING), "latest");
    opt_stats_log     = option_is(get_option(OPTION_STATS_LOG), "on");
 }
 
@@ -722,6 +737,8 @@ static void reset_session_stats(void)
    session_paused_frames = 0;
 }
 
+static void restart_stats_second(retro_time_t end);
+
 /* Opens the selected device. Without `force`, does nothing if the device and
  * conversion mode are unchanged. */
 static void apply_device_selection(bool force)
@@ -747,6 +764,7 @@ static void apply_device_selection(bool force)
    seconds_black         = 0.0;
    retry_timer           = RETRY_INTERVAL;
 
+   restart_stats_second(perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0);
    log_session_stats();
    reset_session_stats();
    shown_sequence       = 0;
@@ -754,6 +772,9 @@ static void apply_device_selection(bool force)
    pacing_resync        = false;
    rate_anchor_sequence = 0;
    rate_nominal         = 0.0;
+   adjusting             = false;
+   adjust_events         = 0;
+   adjust_cooldown_until = 0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -766,7 +787,6 @@ static void apply_device_selection(bool force)
    last_run_received = capture_frames_received();
    waiting_first_run = true;
 
-   stats_last_time     = 0; /* Restart the stats measurement */
    stats_lines[0][0]   = '\0';
 }
 
@@ -908,6 +928,83 @@ static double measure_frame_rate(const capture_frame_t *frame)
    return rate_reported;
 }
 
+/* Counts dropped or repeated frames for phase_adjust_factor(). */
+static void note_collision(uint64_t frames)
+{
+   if (opt_smooth_pacing || adjusting)
+      return;
+
+   if (session_runs - adjust_window_start > ADJUST_WINDOW_RUNS)
+   {
+      adjust_window_start = session_runs;
+      adjust_events       = 0;
+   }
+   adjust_events += (unsigned)frames;
+}
+
+/*
+ * With Lowest Latency, gets out of the collision zone described in
+ * pick_frame(). When the device and RetroArch run at the same rate, frames
+ * arriving right when RetroArch asks for one keep doing so for a long time,
+ * and frames are dropped and repeated all along. When that happens, the core
+ * reports a slightly higher rate (ADJUST_FACTOR); with a variable refresh
+ * rate display, RetroArch follows it and its calls drift relative to the
+ * frames. Once frames arrive halfway between two calls, the normal rate is
+ * reported again.
+ *
+ * Returns the factor to apply to the reported rate. `age_ms` is the age of
+ * the frame just shown.
+ */
+static double phase_adjust_factor(double age_ms)
+{
+   const double period_ms = 1000.0 / rate_reported;
+
+   if (opt_smooth_pacing)
+   {
+      adjusting = false;
+      return 1.0;
+   }
+
+   if (!adjusting)
+   {
+      if (adjust_events < ADJUST_EVENTS || session_runs < adjust_cooldown_until)
+         return 1.0;
+
+      adjusting             = true;
+      adjust_start_run      = session_runs;
+      adjust_settled_frames = 0;
+      adjust_events         = 0;
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frames arrive right when RetroArch asks for one: shifting the timing.\n");
+      stats_log_printf("Frames arrive right when RetroArch asks for one: shifting the timing.");
+   }
+
+   if (age_ms >= period_ms * 0.35 && age_ms <= period_ms * 0.65)
+   {
+      if (++adjust_settled_frames >= ADJUST_SETTLED_FRAMES)
+      {
+         adjusting = false;
+         log_cb(RETRO_LOG_INFO, LOG_PREFIX "Timing shifted in %.1f s.\n",
+               (double)(session_runs - adjust_start_run) / rate_reported);
+         stats_log_printf("Timing shifted in %.1f s.", (double)(session_runs - adjust_start_run) / rate_reported);
+         return 1.0;
+      }
+   }
+   else
+      adjust_settled_frames = 0;
+
+   if (session_runs - adjust_start_run > ADJUST_TIMEOUT_RUNS)
+   {
+      adjusting             = false;
+      adjust_cooldown_until = session_runs + ADJUST_COOLDOWN_RUNS;
+      log_cb(RETRO_LOG_WARN, LOG_PREFIX "Could not shift the timing: RetroArch does not follow the core's "
+            "frame rate. This requires a variable refresh rate display with Sync to Exact Content Framerate.\n");
+      stats_log_printf("Could not shift the timing: RetroArch does not follow the core's frame rate.");
+      return 1.0;
+   }
+
+   return ADJUST_FACTOR;
+}
+
 /* Makes sure rgb_buffer holds at least `pixels` pixels. */
 static bool reserve_rgb_buffer(size_t pixels)
 {
@@ -956,6 +1053,24 @@ static uint32_t rate_color(double measured, double expected)
    if (difference <= 2.0)
       return STATS_COLOR_NEUTRAL;
    return STATS_COLOR_BAD;
+}
+
+/* Ends the current stats second early, before a pause or a device restart.
+ * Frames dropped or repeated in that partial second are written to the stats
+ * log, so the per-second lines add up to the session summary. `end` is the
+ * time the partial second ends. */
+static void restart_stats_second(retro_time_t end)
+{
+   if (stats_last_time && end > stats_last_time &&
+       (stats_dropped || stats_repeated || stats_pacing_skips))
+      stats_log_printf("Partial second (%.2f s): dropped %llu (pacing skips %llu), repeated %llu",
+            (double)(end - stats_last_time) / 1000000.0, (unsigned long long)stats_dropped,
+            (unsigned long long)stats_pacing_skips, (unsigned long long)stats_repeated);
+
+   stats_dropped      = 0;
+   stats_repeated     = 0;
+   stats_pacing_skips = 0;
+   stats_last_time    = 0;
 }
 
 /* Measures three rates about once per second and updates the stats text:
@@ -1410,6 +1525,7 @@ static bool pick_frame(capture_frame_t *frame)
    {
       stats_dropped   += pick - shown_sequence - 1;
       session_dropped += pick - shown_sequence - 1;
+      note_collision(pick - shown_sequence - 1);
    }
 
    shown_sequence = pick;
@@ -1447,16 +1563,23 @@ static enum signal_state poll_capture(bool *new_frame)
       stats_frames_shown++;
       session_frames_shown++;
 
+      *new_frame = true;
+
       if (frame.arrival_usec)
       {
          const double age_ms = (double)(capture_time_usec() - frame.arrival_usec) / 1000.0;
+         double fps;
+
          if (!frame_age_count || age_ms < frame_age_min_ms) frame_age_min_ms = age_ms;
          if (!frame_age_count || age_ms > frame_age_max_ms) frame_age_max_ms = age_ms;
          frame_age_sum_ms += age_ms;
          frame_age_count++;
+
+         fps = measure_frame_rate(&frame);
+         update_frame_rate(fps * phase_adjust_factor(age_ms));
       }
-      *new_frame = true;
-      update_frame_rate(measure_frame_rate(&frame));
+      else
+         update_frame_rate(frame.frame_rate);
    }
    else
    {
@@ -1465,6 +1588,7 @@ static enum signal_state poll_capture(bool *new_frame)
       {
          stats_repeated++;
          session_repeated++;
+         note_collision(1);
       }
    }
 
@@ -1608,7 +1732,7 @@ static void detect_pause(void)
 
       session_paused_usec   += gap;
       session_paused_frames += received >= last_run_received ? received - last_run_received : 0;
-      stats_last_time        = 0; /* Restart the stats second */
+      restart_stats_second(last_run_usec);
       pacing_resync          = true;
 
       if (first_run)
@@ -1704,6 +1828,7 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
+   restart_stats_second(perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0);
    log_session_stats();
    capture_stop();
    active_device_id[0] = '\0';
