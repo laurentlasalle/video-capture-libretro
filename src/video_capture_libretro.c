@@ -155,10 +155,20 @@ static double  audio_frames_pending; /* Fractional audio frames carried between 
 /* Stats */
 static retro_time_t stats_last_time;
 static uint64_t     stats_last_received;
-static uint64_t     stats_frames_shown;
-static double       stats_capture_fps;
-static double       stats_output_fps;
-static char         stats_lines[2][96];
+static uint64_t     stats_frames_shown;  /* New frames shown since stats_last_time */
+static uint64_t     stats_runs;          /* retro_run() calls since stats_last_time */
+static double       stats_capture_fps;   /* Frames received from the device per second */
+static double       stats_frontend_fps;  /* retro_run() calls per second */
+static double       stats_output_fps;    /* New frames shown per second */
+
+#define STATS_LINES 3
+static char         stats_lines[STATS_LINES][96];
+static uint32_t     stats_colors[STATS_LINES];
+
+/* Stats colors: as expected, slightly off, or frames are being lost. */
+#define STATS_COLOR_GOOD    0x40FF40
+#define STATS_COLOR_NEUTRAL 0xFFFFFF
+#define STATS_COLOR_BAD     0xFF4040
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
@@ -480,9 +490,7 @@ static void apply_device_selection(bool force)
       log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s\n", capture_last_error());
 
    stats_last_time     = 0; /* Restart the stats measurement */
-   stats_frames_shown  = 0;
-   stats_capture_fps   = 0.0;
-   stats_output_fps    = 0.0;
+   stats_lines[0][0]   = '\0';
 }
 
 /* ------------------------------------------------------------------------ */
@@ -576,13 +584,36 @@ static const char *format_name(enum capture_format format)
    }
 }
 
-/* Measures the capture and output frame rates about once per second and
- * updates the stats text. */
+/* Color for a measured rate compared with the rate it should reach. Rates are
+ * measured over about one second, so one frame more or less (1 fps) is normal
+ * timing noise; two is borderline; more means frames are being lost. */
+static uint32_t rate_color(double measured, double expected)
+{
+   const double difference = expected - measured;
+
+   if (expected <= 0.0)
+      return STATS_COLOR_NEUTRAL;
+   if (difference <= 1.0)
+      return STATS_COLOR_GOOD;
+   if (difference <= 2.0)
+      return STATS_COLOR_NEUTRAL;
+   return STATS_COLOR_BAD;
+}
+
+/* Measures three rates about once per second and updates the stats text:
+ *   Capture:   frames received from the device, expected at its nominal rate;
+ *   RetroArch: retro_run() calls, expected at the rate the core reported;
+ *   Output:    new frames shown, expected to match the capture rate.
+ * If RetroArch is low, the frontend (or a heavy shader) cannot keep up. If
+ * RetroArch is fine but Output is low, frames are lost to uneven timing
+ * between the device and the frontend. */
 static void update_stats(void)
 {
    const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
    const uint64_t received = capture_frames_received();
    double seconds;
+
+   stats_runs++;
 
    if (!now)
       return;
@@ -592,6 +623,7 @@ static void update_stats(void)
       stats_last_time     = now;
       stats_last_received = received;
       stats_frames_shown  = 0;
+      stats_runs          = 0;
       return;
    }
 
@@ -600,23 +632,31 @@ static void update_stats(void)
       return;
 
    stats_capture_fps   = (double)(received - stats_last_received) / seconds;
+   stats_frontend_fps  = (double)stats_runs / seconds;
    stats_output_fps    = (double)stats_frames_shown / seconds;
    stats_last_time     = now;
    stats_last_received = received;
    stats_frames_shown  = 0;
+   stats_runs          = 0;
 
-   snprintf(stats_lines[0], sizeof(stats_lines[0]), "Capture: %6.2f fps  %ux%u %s",
+   snprintf(stats_lines[0], sizeof(stats_lines[0]), "Capture:   %6.2f fps  %ux%u %s",
          stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format));
-   snprintf(stats_lines[1], sizeof(stats_lines[1]), "Output:  %6.2f fps  %ux%u",
+   snprintf(stats_lines[1], sizeof(stats_lines[1]), "RetroArch: %6.2f fps",
+         stats_frontend_fps);
+   snprintf(stats_lines[2], sizeof(stats_lines[2]), "Output:    %6.2f fps  %ux%u",
          stats_output_fps, output_width, output_height);
+
+   stats_colors[0] = rate_color(stats_capture_fps, last_frame.frame_rate);
+   stats_colors[1] = rate_color(stats_frontend_fps, output_fps);
+   stats_colors[2] = rate_color(stats_output_fps, stats_capture_fps);
 
    if (opt_stats == STATS_NOTIFICATION)
    {
-      char text[200];
+      char text[240];
 
-      snprintf(text, sizeof(text), "Capture %.2f fps (%ux%u %s) | Output %.2f fps (%ux%u)",
+      snprintf(text, sizeof(text), "Capture %.2f fps (%ux%u %s) | RetroArch %.2f fps | Output %.2f fps (%ux%u)",
             stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format),
-            stats_output_fps, output_width, output_height);
+            stats_frontend_fps, stats_output_fps, output_width, output_height);
 
       if (message_interface_version >= 1)
       {
@@ -643,27 +683,32 @@ static void update_stats(void)
 }
 
 /* Draws the stats in the top-left corner of an output image, on a dark box
- * so the text stays readable over any picture. */
+ * so the text stays readable over any picture. Each line is colored by
+ * rate_color(). */
 static void draw_stats_overlay(uint32_t *image, size_t pitch, unsigned width, unsigned height)
 {
    /* Text height about 1/30 of the image: 8 px at 240 lines, 32 px at 1080. */
    const unsigned scale = height >= 240 ? height / 240 : 1;
    const unsigned line_height = (FONT_GLYPH_SIZE + 2) * scale;
    const unsigned margin = 2 * scale;
-   unsigned box_width = font_text_width(stats_lines[0], scale);
-   unsigned w1 = font_text_width(stats_lines[1], scale);
+   unsigned box_width = 0;
    int i;
 
    if (!stats_lines[0][0])
       return;
-   if (w1 > box_width)
-      box_width = w1;
+
+   for (i = 0; i < STATS_LINES; i++)
+   {
+      const unsigned w = font_text_width(stats_lines[i], scale);
+      if (w > box_width)
+         box_width = w;
+   }
 
    font_fill_rect(image, pitch, width, height, 0, 0,
-         (int)(box_width + 2 * margin), (int)(2 * line_height + 2 * margin), 0x101010);
-   for (i = 0; i < 2; i++)
+         (int)(box_width + 2 * margin), (int)(STATS_LINES * line_height + 2 * margin), 0x101010);
+   for (i = 0; i < STATS_LINES; i++)
       font_draw_text(image, pitch, width, height, (int)margin, (int)(margin + i * line_height),
-            stats_lines[i], scale, 0xFFFF40);
+            stats_lines[i], scale, stats_colors[i]);
 }
 
 /* ------------------------------------------------------------------------ */
