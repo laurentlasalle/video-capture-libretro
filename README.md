@@ -26,10 +26,12 @@ Close OBS or any other application using the device first: most capture devices 
 | Capture Device | Auto, detected devices | Device to display. Auto selects the first device found. Devices are detected when the core starts. |
 | Output Resolution | Native, 640x480, 320x240 | Size of the image passed to the shaders. CRT and VHS shaders expect a low resolution. Downscaling averages the source pixels to avoid aliasing. |
 | Aspect Ratio | Source, 4:3 (Squash), 4:3 (Crop Pillarbox), 16:9 | Display aspect ratio. *Squash* keeps the whole frame, for a 4:3 picture stretched to 16:9. *Crop Pillarbox* keeps only the central 4:3 area, for a picture with black bars on the sides. |
+| Frame Pacing | Smooth, Lowest Latency | The capture device and RetroArch run on separate clocks, so frames periodically arrive right when RetroArch asks for one. *Smooth* shows every frame in order, at the cost of up to one frame of latency at those moments, and skips a single frame now and then to catch up; recommended to watch video. *Lowest Latency* always shows the newest frame, but drops and repeats frames for a few seconds at those moments; recommended to play games through the capture device. |
 | Color Conversion | Core, Media Foundation | Who converts the device's YUV picture to RGB. *Core* converts after downscaling, which is faster at 640x480 and 320x240, and applies the two options below. *Media Foundation* converts the full frame with Windows. |
 | Color Space | Default, Rec. 709, Rec. 601 | Color matrix for the conversion. *Default* uses Rec. 601 up to 576 lines and Rec. 709 above. |
 | Color Range | Limited, Full | *Limited* is standard for video (black at 16, white at 235). Use *Full* if blacks look gray or colors look washed out. |
 | Show Capture Stats | Off, On-Screen Notification, In Image | Three frame rates, measured every second: *Capture* (frames received from the device), *RetroArch* (calls to the core) and *Output* (new frames shown). In the image, each line is green when the rate is as expected, white when slightly low, red when frames are being lost. A low RetroArch rate means the frontend or a heavy shader cannot keep up; a normal RetroArch rate with a low Output rate means frames are lost to uneven timing. *In Image* draws the text into the picture, before shaders. |
+| Log Capture Stats | Off, On | Shown when Show Capture Stats is on. Writes the stats every second, with the age of each frame when shown, to `video_capture_stats.log` in RetroArch's save directory. |
 | No Signal Details | Off, On | Shows the reason and troubleshooting hints on the No Signal screen. |
 
 Resolution and aspect ratio are independent: 640x480 with 16:9 gives an anamorphic image, like a DVD. For the core's aspect ratio to be used, set **Settings > Video > Scaling > Aspect Ratio** to **Core Provided**. A shader preset may still force its own aspect ratio.
@@ -65,7 +67,9 @@ The display's refresh rate decides whether every captured frame is shown. Captur
 1. **Variable refresh rate display (G-Sync, FreeSync)**: enable **Settings > Video > Synchronization > Sync to Exact Content Framerate**. The display follows the capture device exactly and no frame is lost.
 2. **Fixed refresh rate display**: set the display to 59.94 Hz or 60 Hz in Windows, and keep **VSync** on in RetroArch with **VSync Swap Interval** at 1. A frame may still be dropped or repeated occasionally, since the display and the capture device have separate clocks.
 
-Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. When the core closes, a summary of the session (average rates and frames not shown) is written to the log.
+Even with matching rates, the capture device and RetroArch run on separate clocks: the moment a frame arrives slowly drifts relative to the moment RetroArch asks for one. Every few seconds to a few minutes, depending on the clocks, the two meet. With **Frame Pacing** set to **Smooth** (the default), the core absorbs this with at most one frame of extra latency and a single skipped frame; with **Lowest Latency**, frames are dropped and repeated for a few seconds.
+
+Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. With **Log Capture Stats**, the rates and the age of each frame when shown are written every second to `video_capture_stats.log`, followed by a session summary when the core closes. RetroArch 1.16 does not keep core messages in its own log once content is running, hence the separate file.
 
 ## Troubleshooting
 

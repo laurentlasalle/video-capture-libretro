@@ -220,21 +220,24 @@ struct mf_scope
 };
 
 /* ------------------------------------------------------------------------ */
-/* Shared frame state (triple buffering)                                     */
+/* Shared frame state (ring of recent frames)                                */
 /* ------------------------------------------------------------------------ */
 
 /*
- * Three frame slots rotate between the device and the core without copying:
- *   - write: filled by the Media Foundation callback thread;
- *   - ready: the most recent complete frame;
- *   - read:  owned by the core until its next capture_acquire_frame() call.
- * A finished write slot is swapped with the ready slot; the core swaps the
- * ready slot with its read slot. A frame the core never picked up is simply
- * overwritten, so there is no queue and no added latency.
+ * A small ring of slots holds the most recent frames, numbered in arrival
+ * order (sequence 1, 2, 3...). At any time one slot may be in use by each
+ * side, and neither is ever overwritten while in use:
+ *   - the writing slot, filled by the Media Foundation callback thread. It is
+ *     always the slot with the oldest frame, which is dropped;
+ *   - the reading slot, owned by the core until its next acquire.
+ * The other slots hold the latest complete frames. The core chooses which one
+ * to show (see the Frame Pacing option), so no frame is copied twice.
  *
  * Slots store images tightly packed (stride = width * bytes per pixel), with
  * the NV12 chroma plane directly after the luma plane.
  */
+#define RING_SLOTS 5
+
 struct frame_slot
 {
    std::vector<uint8_t> data;
@@ -243,14 +246,38 @@ struct frame_slot
    unsigned             width  = 0;
    unsigned             height = 0;
    int64_t              arrival_usec = 0;
+   uint64_t             sequence = 0; /* 0: empty or being written */
 };
 
-static frame_slot  g_slots[3];
-static frame_slot *g_write_slot = &g_slots[0];
-static frame_slot *g_ready_slot = &g_slots[1];
-static frame_slot *g_read_slot  = &g_slots[2];
-static bool        g_ready_is_new;
-static std::mutex  g_slot_mutex; /* Guards the slot pointers and g_ready_is_new */
+static frame_slot g_ring[RING_SLOTS];
+static int        g_writing = -1;     /* Slot being written, or -1 */
+static int        g_reading = -1;     /* Slot owned by the core, or -1 */
+static uint64_t   g_next_sequence = 1;
+static std::mutex g_slot_mutex;       /* Guards the sequences and slot indexes */
+
+/* Picks the slot to write: an empty one, or the one with the oldest frame,
+ * never the slot the core is reading. Its frame is discarded. */
+static frame_slot *begin_write(void)
+{
+   std::lock_guard<std::mutex> lock(g_slot_mutex);
+   int best = -1;
+
+   for (int i = 0; i < RING_SLOTS; i++)
+      if (i != g_reading && (best < 0 || g_ring[i].sequence < g_ring[best].sequence))
+         best = i;
+
+   g_ring[best].sequence = 0;
+   g_writing = best;
+   return &g_ring[best];
+}
+
+/* Publishes the slot being written as the newest frame. */
+static void end_write(void)
+{
+   std::lock_guard<std::mutex> lock(g_slot_mutex);
+   g_ring[g_writing].sequence = g_next_sequence++;
+   g_writing = -1;
+}
 
 /* Current output format of the source reader. Written by update_output_format()
  * and read by the callback thread; guarded by g_format_mutex. */
@@ -340,7 +367,7 @@ static int64_t qpc_usec(void)
 static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
       enum capture_format format, unsigned width, unsigned height, int64_t arrival_usec)
 {
-   frame_slot *slot = g_write_slot; /* Only this thread touches the write slot */
+   frame_slot *slot = begin_write(); /* Only this thread writes to the slot */
    const size_t bytes_per_pixel = format == CAPTURE_FORMAT_XRGB8888 ? 4 : (format == CAPTURE_FORMAT_YUY2 ? 2 : 1);
    const size_t row_bytes = (size_t)width * bytes_per_pixel;
    const size_t luma_size = row_bytes * height;
@@ -368,14 +395,11 @@ static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
 
    slot->stride       = row_bytes;
    slot->arrival_usec = arrival_usec;
-   slot->format = format;
-   slot->width  = width;
-   slot->height = height;
+   slot->format       = format;
+   slot->width        = width;
+   slot->height       = height;
 
-   /* Publish: the finished frame becomes the ready one. */
-   std::lock_guard<std::mutex> lock(g_slot_mutex);
-   std::swap(g_write_slot, g_ready_slot);
-   g_ready_is_new = true;
+   end_write();
 }
 
 static void store_sample(IMFSample *sample, int64_t arrival_usec)
@@ -951,7 +975,9 @@ extern "C" bool capture_start(const char *id, bool raw_yuv)
    /* Forget any frame left by a previous device. */
    {
       std::lock_guard<std::mutex> lock(g_slot_mutex);
-      g_ready_is_new = false;
+      for (int i = 0; i < RING_SLOTS; i++)
+         g_ring[i].sequence = 0;
+      g_reading = -1;
    }
 
    /* Start streaming: each OnReadSample requests the next frame. */
@@ -1006,22 +1032,58 @@ extern "C" uint64_t capture_frames_received(void)
    return g_frames_received;
 }
 
-extern "C" bool capture_acquire_frame(capture_frame_t *frame)
+extern "C" bool capture_peek_frames(uint64_t *oldest, uint64_t *newest, int64_t *newest_arrival_usec)
 {
+   std::lock_guard<std::mutex> lock(g_slot_mutex);
+   int newest_slot = -1;
+
+   *oldest = 0;
+   *newest = 0;
+   for (int i = 0; i < RING_SLOTS; i++)
    {
-      std::lock_guard<std::mutex> lock(g_slot_mutex);
-      if (!g_ready_is_new)
-         return false;
-      std::swap(g_read_slot, g_ready_slot);
-      g_ready_is_new = false;
+      const uint64_t sequence = g_ring[i].sequence;
+      if (!sequence)
+         continue;
+      if (!*oldest || sequence < *oldest)
+         *oldest = sequence;
+      if (sequence > *newest)
+      {
+         *newest     = sequence;
+         newest_slot = i;
+      }
    }
 
-   frame->data       = g_read_slot->data.data();
-   frame->stride     = g_read_slot->stride;
-   frame->format     = g_read_slot->format;
-   frame->width      = g_read_slot->width;
-   frame->height     = g_read_slot->height;
+   if (newest_slot < 0)
+      return false;
+   *newest_arrival_usec = g_ring[newest_slot].arrival_usec;
+   return true;
+}
+
+extern "C" bool capture_acquire_frame(uint64_t sequence, capture_frame_t *frame)
+{
+   frame_slot *slot = nullptr;
+
+   {
+      std::lock_guard<std::mutex> lock(g_slot_mutex);
+      for (int i = 0; i < RING_SLOTS; i++)
+         if (g_ring[i].sequence == sequence && sequence)
+         {
+            g_reading = i; /* Protected from the writer until the next acquire */
+            slot = &g_ring[i];
+            break;
+         }
+   }
+
+   if (!slot)
+      return false;
+
+   frame->data         = slot->data.data();
+   frame->stride       = slot->stride;
+   frame->format       = slot->format;
+   frame->width        = slot->width;
+   frame->height       = slot->height;
    frame->frame_rate   = capture_get_frame_rate();
-   frame->arrival_usec = g_read_slot->arrival_usec;
+   frame->arrival_usec = slot->arrival_usec;
+   frame->sequence     = sequence;
    return true;
 }

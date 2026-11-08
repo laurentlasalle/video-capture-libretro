@@ -11,7 +11,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-/* fopen() is used for the temporary diagnostic file. */
+/* fopen() is used for the capture stats log file. */
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <stdint.h>
@@ -47,6 +47,13 @@
 /* Seconds between attempts to reopen a device that failed. */
 #define RETRY_INTERVAL    3.0
 
+/* Smooth frame pacing (see pick_frame()). A frame arriving within this many
+ * milliseconds of retro_run() is in the "collision zone", where timing noise
+ * decides whether it is ready in time. */
+#define PACING_GUARD_MS   2.5
+/* retro_run() calls outside the collision zone before catching up one frame. */
+#define PACING_SKIP_RUNS  30
+
 /* ------------------------------------------------------------------------ */
 /* Core options                                                              */
 /* ------------------------------------------------------------------------ */
@@ -59,6 +66,8 @@
 #define OPTION_COLOR_RANGE "video_capture_color_range"
 #define OPTION_STATS       "video_capture_stats"
 #define OPTION_DETAILS     "video_capture_no_signal_details"
+#define OPTION_PACING      "video_capture_frame_pacing"
+#define OPTION_STATS_LOG   "video_capture_stats_log"
 #define DEVICE_AUTO        "auto"
 
 enum output_resolution
@@ -98,6 +107,8 @@ static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
 static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
 static enum stats_mode         opt_stats       = STATS_OFF;
 static bool                    opt_details     = false;
+static bool                    opt_smooth_pacing = true;
+static bool                    opt_stats_log   = false;
 
 /* ------------------------------------------------------------------------ */
 /* State                                                                     */
@@ -169,15 +180,18 @@ static retro_time_t session_start_time;
 static uint64_t     session_frames_shown;
 static uint64_t     session_runs;
 
-/* TEMPORARY DIAGNOSTIC: age of each frame when the core picks it up (time
- * between its arrival from the device and retro_run()), over the current
- * stats second. Logged with the rates to study frame pacing; remove once
- * the periodic frame drops are understood. */
-static double   diag_age_min_ms;
-static double   diag_age_max_ms;
-static double   diag_age_sum_ms;
-static unsigned diag_age_count;
-static unsigned diag_seconds;
+/* Age of each frame when shown (time between its arrival from the device and
+ * retro_run()), over the current stats second. */
+static double   frame_age_min_ms;
+static double   frame_age_max_ms;
+static double   frame_age_sum_ms;
+static unsigned frame_age_count;
+static unsigned stats_seconds;      /* Seconds since stats started, for the log */
+static uint64_t stats_pacing_skips; /* Frames skipped on purpose by smooth pacing */
+
+/* Frame pacing state */
+static uint64_t shown_sequence;     /* Sequence of the frame shown last, 0 if none */
+static unsigned pacing_safe_runs;   /* Consecutive runs behind, outside the collision zone */
 
 #define STATS_LINES 3
 static char         stats_lines[STATS_LINES][96];
@@ -190,10 +204,10 @@ static uint32_t     stats_colors[STATS_LINES];
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
-static struct retro_core_option_v2_definition option_definitions[9];
+static struct retro_core_option_v2_definition option_definitions[11];
 static struct retro_core_option_v2_category   option_categories[1];
 static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
-static struct retro_variable legacy_variables[9];
+static struct retro_variable legacy_variables[11];
 
 /* ------------------------------------------------------------------------ */
 /* Logging                                                                   */
@@ -209,48 +223,58 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
    va_end(va);
 }
 
-/* TEMPORARY DIAGNOSTIC: core messages logged while content runs do not
- * reach RetroArch's log file on the tester's machine. Diagnostic lines are
- * therefore also written to video_capture_diag.log in RetroArch's save
- * directory, flushed after each line. */
-static FILE *diag_file;
+/* Capture stats log: one line per second in video_capture_stats.log, in
+ * RetroArch's save directory, while Show Capture Stats and Log Capture Stats
+ * are on. A separate file is used because RetroArch 1.16 does not keep core
+ * messages in its own log once content is running. */
+static FILE *stats_log_file;
 
-static void diag_open(void)
+static void stats_log_printf(const char *fmt, ...)
 {
-   const char *dir = NULL;
-   char path[1024];
+   va_list va;
 
-   if (diag_file || !environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) || !dir)
+   if (!stats_log_file)
       return;
 
-   snprintf(path, sizeof(path), "%s%cvideo_capture_diag.log", dir,
+   va_start(va, fmt);
+   vfprintf(stats_log_file, fmt, va);
+   va_end(va);
+   fputc('\n', stats_log_file);
+   fflush(stats_log_file);
+}
+
+/* Opens or closes the stats log to match the options. */
+static void update_stats_log_file(void)
+{
+   const bool wanted = opt_stats_log && opt_stats != STATS_OFF;
+   const char *dir   = NULL;
+   char path[1024];
+
+   if (wanted == (stats_log_file != NULL))
+      return;
+
+   if (!wanted)
+   {
+      fclose(stats_log_file);
+      stats_log_file = NULL;
+      return;
+   }
+
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) || !dir)
+      return;
+
+   snprintf(path, sizeof(path), "%s%cvideo_capture_stats.log", dir,
 #ifdef _WIN32
          '\\'
 #else
          '/'
 #endif
          );
-   diag_file = fopen(path, "w");
-   if (log_cb)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "[diag] Diagnostic file: %s (%s).\n", path, diag_file ? "open" : "could not open");
-}
-
-static void diag_printf(const char *fmt, ...)
-{
-   char line[512];
-   va_list va;
-
-   va_start(va, fmt);
-   vsnprintf(line, sizeof(line), fmt, va);
-   va_end(va);
-
-   if (log_cb)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "%s\n", line);
-   if (diag_file)
-   {
-      fprintf(diag_file, "%s\n", line);
-      fflush(diag_file);
-   }
+   stats_log_file = fopen(path, "w");
+   log_cb(stats_log_file ? RETRO_LOG_INFO : RETRO_LOG_WARN, LOG_PREFIX "Capture stats log: %s (%s).\n",
+         path, stats_log_file ? "open" : "could not open");
+   stats_log_printf("Video Capture Device %s, frame pacing: %s.", CORE_VERSION,
+         opt_smooth_pacing ? "Smooth" : "Lowest Latency");
 }
 
 /* Forwards backend messages to the frontend log. */
@@ -342,6 +366,14 @@ static const char *const stats_values[] = {
 static const char *const details_values[] = {
    "off", "Off", "on", "On", NULL
 };
+static const char *const pacing_values[] = {
+   "smooth", "Smooth", "latest", "Lowest Latency", NULL
+};
+static const char *const stats_log_values[] = {
+   "off", "Off", "on", "On", NULL
+};
+
+static bool update_option_visibility(void);
 
 static void declare_core_options(void)
 {
@@ -384,6 +416,15 @@ static void declare_core_options(void)
             "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.",
             "source", aspect_values);
 
+      define_option(def++, OPTION_PACING, "Frame Pacing",
+            "The capture device and RetroArch run on separate clocks, so frames periodically arrive "
+            "right when RetroArch asks for one. "
+            "Smooth shows every frame in order, at the cost of up to one frame of latency (about 16 ms) "
+            "at those moments, and skips a single frame now and then to catch up. Recommended to watch video. "
+            "Lowest Latency always shows the newest frame, but drops and repeats frames for a few seconds "
+            "at those moments. Recommended to play games through the capture device.",
+            "smooth", pacing_values);
+
       define_option(def++, OPTION_CONVERSION, "Color Conversion",
             "Converts the device's YUV picture to the RGB format RetroArch needs. "
             "Core converts after downscaling, which is faster at 640x480 and 320x240, "
@@ -410,6 +451,12 @@ static void declare_core_options(void)
             "In Image draws the text into the picture, before shaders.",
             "off", stats_values);
 
+      define_option(def++, OPTION_STATS_LOG, "Log Capture Stats",
+            "Writes the capture stats every second, with the age of each frame when shown, to "
+            "video_capture_stats.log in RetroArch's save directory. Useful to troubleshoot frame pacing. "
+            "Shown only when Show Capture Stats is on.",
+            "off", stats_log_values);
+
       define_option(def++, OPTION_DETAILS, "No Signal Details",
             "Shows the reason and troubleshooting hints on the No Signal screen.",
             "off", details_values);
@@ -417,6 +464,12 @@ static void declare_core_options(void)
       options.categories  = option_categories;
       options.definitions = option_definitions;
       environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &options);
+
+      {
+         struct retro_core_options_update_display_callback callback;
+         callback.callback = update_option_visibility;
+         environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK, &callback);
+      }
    }
    else
    {
@@ -444,8 +497,12 @@ static void declare_core_options(void)
       legacy_variables[6].value = "Show Capture Stats; off|notification|image";
       legacy_variables[7].key   = OPTION_DETAILS;
       legacy_variables[7].value = "No Signal Details; off|on";
-      legacy_variables[8].key   = NULL;
-      legacy_variables[8].value = NULL;
+      legacy_variables[8].key   = OPTION_PACING;
+      legacy_variables[8].value = "Frame Pacing; smooth|latest";
+      legacy_variables[9].key   = OPTION_STATS_LOG;
+      legacy_variables[9].value = "Log Capture Stats; off|on";
+      legacy_variables[10].key   = NULL;
+      legacy_variables[10].value = NULL;
       environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, legacy_variables);
    }
 }
@@ -465,6 +522,26 @@ static const char *get_option(const char *key)
 static bool option_is(const char *value, const char *expected)
 {
    return value && strcmp(value, expected) == 0;
+}
+
+/* Shows Log Capture Stats only when Show Capture Stats is on. Called by the
+ * frontend when the options menu is displayed or an option changes; returns
+ * true if the visibility changed. */
+static bool update_option_visibility(void)
+{
+   static int visible = -1; /* Unknown until the first call */
+   const char *stats = get_option(OPTION_STATS);
+   const bool show   = stats && !option_is(stats, "off");
+   struct retro_core_option_display display;
+
+   if (visible == (int)show)
+      return false;
+
+   display.key     = OPTION_STATS_LOG;
+   display.visible = show;
+   environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &display);
+   visible = show;
+   return true;
 }
 
 /* Reads every option except the device, which apply_device_selection() handles. */
@@ -497,7 +574,9 @@ static void read_options(void)
              : option_is(value, "image")        ? STATS_IMAGE
              : STATS_OFF;
 
-   opt_details = option_is(get_option(OPTION_DETAILS), "on");
+   opt_details       = option_is(get_option(OPTION_DETAILS), "on");
+   opt_smooth_pacing = !option_is(get_option(OPTION_PACING), "latest");
+   opt_stats_log     = option_is(get_option(OPTION_STATS_LOG), "on");
 }
 
 /* Returns the index of the device selected in the core options, or -1. */
@@ -530,12 +609,6 @@ static void log_session_stats(void)
    const uint64_t received = capture_frames_received();
    double seconds;
 
-   /* TEMPORARY DIAGNOSTIC: the summary does not appear in some logs. */
-   diag_printf("[diag] Session stats check: now %lld, start %lld, received %llu, "
-         "shown %llu, runs %llu.", (long long)now, (long long)session_start_time,
-         (unsigned long long)received, (unsigned long long)session_frames_shown,
-         (unsigned long long)session_runs);
-
    if (!now || !session_start_time || !received)
       return;
 
@@ -545,6 +618,11 @@ static void log_session_stats(void)
 
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Session stats over %.0f s: capture %.2f fps, RetroArch %.2f fps, "
          "output %.2f fps; %llu of %llu frames not shown.\n",
+         seconds, received / seconds, session_runs / seconds, session_frames_shown / seconds,
+         (unsigned long long)(received > session_frames_shown ? received - session_frames_shown : 0),
+         (unsigned long long)received);
+   stats_log_printf("Session over %.0f s: capture %.2f fps, RetroArch %.2f fps, output %.2f fps; "
+         "%llu of %llu frames not shown.",
          seconds, received / seconds, session_runs / seconds, session_frames_shown / seconds,
          (unsigned long long)(received > session_frames_shown ? received - session_frames_shown : 0),
          (unsigned long long)received);
@@ -584,6 +662,8 @@ static void apply_device_selection(bool force)
 
    log_session_stats();
    reset_session_stats();
+   shown_sequence   = 0;
+   pacing_safe_runs = 0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -617,7 +697,8 @@ static void set_output_geometry(unsigned width, unsigned height, float aspect)
    geometry.aspect_ratio = aspect;
    environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 
-   diag_printf("Output: %ux%u, aspect ratio %.4f.", width, height, aspect);
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
+   stats_log_printf("Output: %ux%u, aspect ratio %.4f.", width, height, aspect);
 }
 
 /* Returns `fps` if plausible, otherwise the current output rate. */
@@ -732,23 +813,23 @@ static void update_stats(void)
    if (seconds < 1.0)
       return;
 
-   /* TEMPORARY DIAGNOSTIC: one log line per second while stats are shown. */
+   /* Stats log: one line per second. */
    {
       const uint64_t received_delta = received - stats_last_received;
-      diag_printf("[diag] t=%us capture %.2f RetroArch %.2f output %.2f fps | "
-            "not shown %llu, repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
-            ++diag_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
-            (unsigned long long)(received_delta > stats_frames_shown ? received_delta - stats_frames_shown : 0),
-            (unsigned long long)(stats_runs > stats_frames_shown ? stats_runs - stats_frames_shown : 0),
-            diag_age_count ? diag_age_min_ms : 0.0,
-            diag_age_count ? diag_age_sum_ms / diag_age_count : 0.0,
-            diag_age_count ? diag_age_max_ms : 0.0);
-      diag_age_sum_ms = 0.0;
-      diag_age_count  = 0;
 
-      /* Is a level filter dropping runtime messages? */
-      if (diag_seconds % 10 == 1)
-         log_cb(RETRO_LOG_ERROR, LOG_PREFIX "[diag] Error-level test message at t=%us.\n", diag_seconds);
+      stats_seconds++;
+      stats_log_printf("t=%us capture %.2f RetroArch %.2f output %.2f fps | not shown %llu "
+            "(pacing skips %llu), repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
+            stats_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
+            (unsigned long long)(received_delta > stats_frames_shown ? received_delta - stats_frames_shown : 0),
+            (unsigned long long)stats_pacing_skips,
+            (unsigned long long)(stats_runs > stats_frames_shown ? stats_runs - stats_frames_shown : 0),
+            frame_age_count ? frame_age_min_ms : 0.0,
+            frame_age_count ? frame_age_sum_ms / frame_age_count : 0.0,
+            frame_age_count ? frame_age_max_ms : 0.0);
+      frame_age_sum_ms   = 0.0;
+      frame_age_count    = 0;
+      stats_pacing_skips = 0;
    }
 
    stats_capture_fps   = (double)(received - stats_last_received) / seconds;
@@ -1082,6 +1163,67 @@ static void output_no_signal_screen(enum signal_state state)
    video_cb(screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT, last_output_pitch);
 }
 
+/*
+ * Chooses which captured frame to show in this retro_run() call.
+ *
+ * The device and RetroArch run on separate clocks, so the moment a frame
+ * arrives slowly drifts relative to the moment retro_run() is called. When
+ * the two get close (the "collision zone"), timing noise makes two frames
+ * arrive before one call and none before the next.
+ *
+ * Lowest Latency always shows the newest frame. In the collision zone, this
+ * alternates dropped and repeated frames for a few seconds.
+ *
+ * Smooth advances one frame per call: when two frames are ready, it shows the
+ * older one instead of dropping it, which costs one frame of latency. Once
+ * frames arrive away from the collision zone again (for PACING_SKIP_RUNS
+ * calls in a row), it skips one frame to catch up. The clock difference then
+ * costs a single skipped frame per drift cycle instead of a burst of drops
+ * and repeats.
+ *
+ * Returns true and fills `frame` when a frame newer than the last one shown
+ * is available.
+ */
+static bool pick_frame(capture_frame_t *frame)
+{
+   uint64_t oldest, newest, pick;
+   int64_t newest_arrival_usec;
+
+   if (!capture_peek_frames(&oldest, &newest, &newest_arrival_usec) || newest <= shown_sequence)
+      return false;
+
+   pick = newest;
+
+   if (opt_smooth_pacing && shown_sequence)
+   {
+      const uint64_t backlog   = newest - shown_sequence; /* New frames available */
+      const double period_ms   = 1000.0 / output_fps;
+      const double newest_age  = (double)(capture_time_usec() - newest_arrival_usec) / 1000.0;
+      const bool   safe_phase  = newest_age >= PACING_GUARD_MS && newest_age <= period_ms - PACING_GUARD_MS;
+
+      /* Behind by one frame, away from the collision zone: count down to a catch-up. */
+      pacing_safe_runs = (backlog >= 2 && safe_phase) ? pacing_safe_runs + 1 : 0;
+
+      if (backlog >= 3 || pacing_safe_runs >= PACING_SKIP_RUNS)
+      {
+         stats_pacing_skips += backlog - 1;
+         pacing_safe_runs    = 0;
+      }
+      else
+      {
+         pick = shown_sequence + 1;
+         if (pick < oldest)
+            pick = oldest; /* The next frame is gone (for example after a pause) */
+      }
+   }
+
+   if (!capture_acquire_frame(pick, frame))
+      return false;
+
+   shown_sequence = pick;
+   return true;
+}
+
 /* Fetches the latest frame and works out whether there is a usable picture. */
 static enum signal_state poll_capture(bool *new_frame)
 {
@@ -1103,7 +1245,7 @@ static enum signal_state poll_capture(bool *new_frame)
       return capture_is_running() ? SIGNAL_NO_FRAMES : SIGNAL_DEVICE_ERROR;
    }
 
-   if (capture_acquire_frame(&frame))
+   if (pick_frame(&frame))
    {
       last_frame            = frame;
       have_frame            = true;
@@ -1115,10 +1257,10 @@ static enum signal_state poll_capture(bool *new_frame)
       if (frame.arrival_usec)
       {
          const double age_ms = (double)(capture_time_usec() - frame.arrival_usec) / 1000.0;
-         if (!diag_age_count || age_ms < diag_age_min_ms) diag_age_min_ms = age_ms;
-         if (!diag_age_count || age_ms > diag_age_max_ms) diag_age_max_ms = age_ms;
-         diag_age_sum_ms += age_ms;
-         diag_age_count++;
+         if (!frame_age_count || age_ms < frame_age_min_ms) frame_age_min_ms = age_ms;
+         if (!frame_age_count || age_ms > frame_age_max_ms) frame_age_max_ms = age_ms;
+         frame_age_sum_ms += age_ms;
+         frame_age_count++;
       }
       *new_frame = true;
       update_frame_rate(frame.frame_rate);
@@ -1203,11 +1345,10 @@ RETRO_API void retro_init(void)
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
-   if (diag_file)
+   if (stats_log_file)
    {
-      diag_printf("[diag] Core deinitialized.");
-      fclose(diag_file);
-      diag_file = NULL;
+      fclose(stats_log_file);
+      stats_log_file = NULL;
    }
    free(rgb_buffer);
    rgb_buffer      = NULL;
@@ -1259,6 +1400,7 @@ RETRO_API void retro_run(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
       read_options();
+      update_stats_log_file();
       apply_device_selection(false);
       screen_key[0] = '\0';
    }
@@ -1299,13 +1441,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    if (!environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &message_interface_version))
       message_interface_version = 0;
 
-   diag_open();
 
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Core started (version %s).\n", CORE_VERSION);
    if (game && game->path)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Content: %s\n", game->path);
 
    read_options();
+   update_stats_log_file();
    active_device_id[0] = '\0';
    apply_device_selection(true);
 
@@ -1324,7 +1466,6 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
-   diag_printf("[diag] retro_unload_game() called.");
    log_session_stats();
    capture_stop();
    active_device_id[0] = '\0';

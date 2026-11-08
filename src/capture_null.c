@@ -56,8 +56,17 @@ uint64_t capture_frames_received(void)
    return 0;
 }
 
-bool capture_acquire_frame(capture_frame_t *frame)
+bool capture_peek_frames(uint64_t *oldest, uint64_t *newest, int64_t *newest_arrival_usec)
 {
+   (void)oldest;
+   (void)newest;
+   (void)newest_arrival_usec;
+   return false;
+}
+
+bool capture_acquire_frame(uint64_t sequence, capture_frame_t *frame)
+{
+   (void)sequence;
    (void)frame;
    return false;
 }

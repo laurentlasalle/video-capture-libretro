@@ -62,6 +62,7 @@ typedef struct capture_frame
    unsigned            height;
    double              frame_rate; /* Frames per second, or 0 if unknown */
    int64_t             arrival_usec; /* When the frame arrived, on the capture_time_usec() clock */
+   uint64_t            sequence;     /* Arrival order, starting at 1 */
 } capture_frame_t;
 
 /* Sets the function used by the backend to report messages. */
@@ -97,15 +98,18 @@ int64_t capture_time_usec(void);
  * including frames the core never picked up. Used for statistics. */
 uint64_t capture_frames_received(void);
 
-/* Hands over the most recent frame if one arrived since the previous call.
- * Returns false when there is no new frame.
+/* Frames are numbered in arrival order, starting at 1. The backend keeps the
+ * few most recent ones; older frames are dropped, never queued.
  *
- * No copy is made: the backend keeps three buffers (one being written by the
- * device, one holding the latest complete frame, one owned by the core) and
- * swaps pointers. Older frames are dropped, never queued, so latency stays
- * minimal. `frame->data` stays valid until the next call to this function,
- * and the core may draw on it (for the stats overlay). */
-bool capture_acquire_frame(capture_frame_t *frame);
+ * Reports the range of frames currently available and when the newest one
+ * arrived. Returns false if no frame is available. */
+bool capture_peek_frames(uint64_t *oldest, uint64_t *newest, int64_t *newest_arrival_usec);
+
+/* Hands over the frame with the given sequence number, if still available.
+ * No copy is made: `frame->data` points into the backend's buffer, which is
+ * kept untouched until the next call to this function. The core may draw on
+ * it (for the stats overlay). */
+bool capture_acquire_frame(uint64_t sequence, capture_frame_t *frame);
 
 #ifdef __cplusplus
 }
