@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(video_capture_libretro VERSION 0.4.1 LANGUAGES C CXX)
+project(video_capture_libretro VERSION 0.4.2 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "libretro.h"
 #include "capture.h"
@@ -107,7 +108,7 @@ static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
 static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
 static enum stats_mode         opt_stats       = STATS_OFF;
 static bool                    opt_details     = false;
-static bool                    opt_smooth_pacing = true;
+static bool                    opt_smooth_pacing = false;
 static bool                    opt_stats_log   = false;
 
 /* ------------------------------------------------------------------------ */
@@ -188,11 +189,27 @@ static retro_time_t session_paused_usec;   /* Time RetroArch did not run the cor
 static uint64_t     session_paused_frames; /* Frames received during those pauses */
 
 /* Pause detection: RetroArch stops calling retro_run() while its menu is
- * open. Frames missed meanwhile are not counted as drops. */
+ * open, and briefly while it rebuilds a shader (for example when the output
+ * size changes). Frames missed meanwhile are not counted as drops. A gap of
+ * STALL_THRESHOLD_USEC or more is excluded from the stats; from
+ * PAUSE_THRESHOLD_USEC, it is logged as a pause rather than a stall. */
+#define STALL_THRESHOLD_USEC 100000
 #define PAUSE_THRESHOLD_USEC 500000
 static retro_time_t last_run_usec;
 static uint64_t     last_run_received;
-static bool         pacing_resync; /* Show the newest frame next, without counting drops */
+static bool         pacing_resync;    /* Show the newest frame next, without counting drops */
+static bool         waiting_first_run; /* Device opened, retro_run() not called since */
+
+/* Frame rate measurement (see measure_frame_rate()). */
+#define RATE_MIN_USEC   10000000 /* Measure over at least 10 seconds */
+#define RATE_GAP_USEC   500000   /* A longer gap between frames restarts the measurement */
+#define RATE_TOLERANCE  0.0004   /* Relative difference accepted between measured and reported rates */
+static uint64_t rate_anchor_sequence; /* First frame of the measurement, 0 if none */
+static int64_t  rate_anchor_usec;
+static uint64_t rate_last_sequence;
+static int64_t  rate_last_usec;
+static double   rate_nominal;         /* Rate declared by the device */
+static double   rate_reported;        /* Rate reported to RetroArch */
 
 /* Age of each frame when shown (time between its arrival from the device and
  * retro_run()), over the current stats second. */
@@ -219,7 +236,7 @@ static uint32_t     stats_colors[STATS_LINES];
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
 static struct retro_core_option_v2_definition option_definitions[11];
-static struct retro_core_option_v2_category   option_categories[1];
+static struct retro_core_option_v2_category   option_categories[4];
 static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
 static struct retro_variable legacy_variables[11];
 
@@ -242,6 +259,8 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
  * are on. A separate file is used because RetroArch 1.16 does not keep core
  * messages in its own log once content is running. */
 static FILE *stats_log_file;
+
+static void log_options(bool all);
 
 static void stats_log_printf(const char *fmt, ...)
 {
@@ -288,8 +307,8 @@ static void update_stats_log_file(void)
    stats_seconds  = 0;
    log_cb(stats_log_file ? RETRO_LOG_INFO : RETRO_LOG_WARN, LOG_PREFIX "Capture stats log: %s (%s).\n",
          path, stats_log_file ? "open" : "could not open");
-   stats_log_printf("Video Capture Device %s, frame pacing: %s.", CORE_VERSION,
-         opt_smooth_pacing ? "Smooth" : "Lowest Latency");
+   stats_log_printf("Video Capture Device %s. Options:", CORE_VERSION);
+   log_options(true);
 }
 
 /* Forwards backend messages to the frontend log. */
@@ -343,11 +362,13 @@ static void refresh_device_list(void)
 
 /* Fills one option definition. `values` alternates value and label (NULL
  * label: the value is shown) and ends with NULL. */
-static void define_option(struct retro_core_option_v2_definition *def, const char *key,
-      const char *desc, const char *info, const char *default_value, const char *const *values)
+static void define_option(struct retro_core_option_v2_definition *def, const char *category,
+      const char *key, const char *desc, const char *info, const char *default_value,
+      const char *const *values)
 {
    int i;
 
+   def->category_key  = category;
    def->key           = key;
    def->desc          = desc;
    def->info          = info;
@@ -382,7 +403,7 @@ static const char *const details_values[] = {
    "off", "Off", "on", "On", NULL
 };
 static const char *const pacing_values[] = {
-   "smooth", "Smooth", "latest", "Lowest Latency", NULL
+   "latest", "Lowest Latency", "smooth", "Smooth", NULL
 };
 static const char *const stats_log_values[] = {
    "off", "Off", "on", "On", NULL
@@ -407,6 +428,18 @@ static void declare_core_options(void)
       memset(option_definitions, 0, sizeof(option_definitions));
       memset(option_categories, 0, sizeof(option_categories));
 
+      /* Capture Device stays on the main page; the other options are grouped
+       * in submenus. */
+      option_categories[0].key  = "video";
+      option_categories[0].desc = "Video";
+      option_categories[0].info = "Output resolution, aspect ratio and frame pacing.";
+      option_categories[1].key  = "color";
+      option_categories[1].desc = "Color";
+      option_categories[1].info = "Conversion of the device's YUV picture to RGB.";
+      option_categories[2].key  = "diagnostics";
+      option_categories[2].desc = "Diagnostics";
+      option_categories[2].info = "Capture stats and No Signal screen details.";
+
       def->key  = OPTION_DEVICE;
       def->desc = "Capture Device";
       def->info = "Video capture device to display. Auto selects the first device found. "
@@ -418,29 +451,29 @@ static void declare_core_options(void)
       def->default_value = DEVICE_AUTO;
       def++;
 
-      define_option(def++, OPTION_RESOLUTION, "Output Resolution",
+      define_option(def++, "video", OPTION_RESOLUTION, "Output Resolution",
             "Resolution of the image passed to RetroArch and its shaders. "
             "CRT and VHS shaders expect a low resolution such as 640x480 or 320x240. "
             "Downscaling averages the source pixels to avoid aliasing.",
             "native", resolution_values);
 
-      define_option(def++, OPTION_ASPECT, "Aspect Ratio",
+      define_option(def++, "video", OPTION_ASPECT, "Aspect Ratio",
             "Display aspect ratio reported to RetroArch. "
             "4:3 (Squash) keeps the whole frame, for a 4:3 picture stretched to 16:9. "
             "4:3 (Crop Pillarbox) keeps only the central 4:3 area, for a picture with black bars on the sides. "
             "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.",
             "source", aspect_values);
 
-      define_option(def++, OPTION_PACING, "Frame Pacing",
-            "The capture device and RetroArch run on separate clocks, so frames periodically arrive "
-            "right when RetroArch asks for one. "
-            "Smooth shows every frame in order, at the cost of up to one frame of latency (about 16 ms) "
-            "at those moments, and skips a single frame now and then to catch up. Recommended to watch video. "
-            "Lowest Latency always shows the newest frame, but drops and repeats frames for a few seconds "
-            "at those moments. Recommended to play games through the capture device.",
-            "smooth", pacing_values);
+      define_option(def++, "video", OPTION_PACING, "Frame Pacing",
+            "Lowest Latency always shows the newest frame. The core measures the device's real frame rate "
+            "and reports it to RetroArch, so with a variable refresh rate display or Sync to Exact Content "
+            "Framerate, frames arrive at a steady moment and none is lost. "
+            "Smooth shows every frame in order, at the cost of up to one frame of latency (about 16 ms), "
+            "and skips a single frame now and then to catch up. Use it if Show Capture Stats reports "
+            "frames dropped and repeated in bursts, for example with a device whose timing is irregular.",
+            "latest", pacing_values);
 
-      define_option(def++, OPTION_CONVERSION, "Color Conversion",
+      define_option(def++, "color", OPTION_CONVERSION, "Color Conversion",
             "Converts the device's YUV picture to the RGB format RetroArch needs. "
             "Core converts after downscaling, which is faster at 640x480 and 320x240, "
             "and applies the Color Space and Color Range options. "
@@ -448,31 +481,31 @@ static void declare_core_options(void)
             "Changing this option reopens the device.",
             "core", conversion_values);
 
-      define_option(def++, OPTION_COLOR_SPACE, "Color Space",
+      define_option(def++, "color", OPTION_COLOR_SPACE, "Color Space",
             "Color matrix used to convert YUV to RGB. Default uses Rec. 601 up to 576 lines and Rec. 709 above. "
             "Applies only when Color Conversion is set to Core.",
             "default", color_space_values);
 
-      define_option(def++, OPTION_COLOR_RANGE, "Color Range",
+      define_option(def++, "color", OPTION_COLOR_RANGE, "Color Range",
             "Limited is standard for video: black is at level 16 and white at 235. "
             "Use Full if blacks look gray or colors look washed out. "
             "Applies only when Color Conversion is set to Core.",
             "limited", color_range_values);
 
-      define_option(def++, OPTION_STATS, "Show Capture Stats",
+      define_option(def++, "diagnostics", OPTION_STATS, "Show Capture Stats",
             "Shows the frame rate received from the device and the frame rate shown, with the image sizes. "
             "If the output frame rate is lower than the capture frame rate, frames are being dropped. "
             "On-Screen Notification uses RetroArch's notifications. "
             "In Image draws the text into the picture, before shaders.",
             "off", stats_values);
 
-      define_option(def++, OPTION_STATS_LOG, "Log Capture Stats",
+      define_option(def++, "diagnostics", OPTION_STATS_LOG, "Log Capture Stats",
             "Writes the capture stats every second, with the age of each frame when shown, to "
             "video_capture_stats.log in RetroArch's save directory. Useful to troubleshoot frame pacing. "
             "Shown only when Show Capture Stats is on.",
             "off", stats_log_values);
 
-      define_option(def++, OPTION_DETAILS, "No Signal Details",
+      define_option(def++, "diagnostics", OPTION_DETAILS, "No Signal Details",
             "Shows the reason and troubleshooting hints on the No Signal screen.",
             "off", details_values);
 
@@ -513,7 +546,7 @@ static void declare_core_options(void)
       legacy_variables[7].key   = OPTION_DETAILS;
       legacy_variables[7].value = "No Signal Details; off|on";
       legacy_variables[8].key   = OPTION_PACING;
-      legacy_variables[8].value = "Frame Pacing; smooth|latest";
+      legacy_variables[8].value = "Frame Pacing; latest|smooth";
       legacy_variables[9].key   = OPTION_STATS_LOG;
       legacy_variables[9].value = "Log Capture Stats; off|on";
       legacy_variables[10].key   = NULL;
@@ -559,6 +592,39 @@ static bool update_option_visibility(void)
    return true;
 }
 
+/* Last value of each option, to log changes in the stats log. */
+static char option_last_values[sizeof(option_definitions) / sizeof(option_definitions[0])][288];
+
+/* Returns the label shown for an option value. */
+static const char *option_label(const struct retro_core_option_v2_definition *def, const char *value)
+{
+   int i;
+
+   for (i = 0; def->values[i].value; i++)
+      if (strcmp(def->values[i].value, value) == 0)
+         return def->values[i].label ? def->values[i].label : value;
+   return value;
+}
+
+/* Writes the options to the stats log: all of them with `all`, otherwise only
+ * those changed since the previous call. */
+static void log_options(bool all)
+{
+   int i;
+
+   for (i = 0; option_definitions[i].key; i++)
+   {
+      const struct retro_core_option_v2_definition *def = &option_definitions[i];
+      const char *value = get_option(def->key);
+
+      if (!value)
+         continue;
+      if (all || strcmp(value, option_last_values[i]) != 0)
+         stats_log_printf("%s%s: %s.", all ? "  " : "Option changed: ", def->desc, option_label(def, value));
+      snprintf(option_last_values[i], sizeof(option_last_values[i]), "%s", value);
+   }
+}
+
 /* Reads every option except the device, which apply_device_selection() handles. */
 static void read_options(void)
 {
@@ -590,7 +656,7 @@ static void read_options(void)
              : STATS_OFF;
 
    opt_details       = option_is(get_option(OPTION_DETAILS), "on");
-   opt_smooth_pacing = !option_is(get_option(OPTION_PACING), "latest");
+   opt_smooth_pacing = option_is(get_option(OPTION_PACING), "smooth");
    opt_stats_log     = option_is(get_option(OPTION_STATS_LOG), "on");
 }
 
@@ -683,15 +749,22 @@ static void apply_device_selection(bool force)
 
    log_session_stats();
    reset_session_stats();
-   shown_sequence    = 0;
-   pacing_safe_runs  = 0;
-   pacing_resync     = false;
-   last_run_usec     = 0;
+   shown_sequence       = 0;
+   pacing_safe_runs     = 0;
+   pacing_resync        = false;
+   rate_anchor_sequence = 0;
+   rate_nominal         = 0.0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
    else
       log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s\n", capture_last_error());
+
+   /* The time until the next retro_run() is treated like a pause: at startup,
+    * RetroArch sets up its video driver and shaders after loading the core. */
+   last_run_usec     = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   last_run_received = capture_frames_received();
+   waiting_first_run = true;
 
    stats_last_time     = 0; /* Restart the stats measurement */
    stats_lines[0][0]   = '\0';
@@ -753,6 +826,86 @@ static void update_frame_rate(double device_rate)
    environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
 
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frame rate: %.3f fps.\n", output_fps);
+}
+
+/*
+ * Works out the frame rate to report to RetroArch from the frames received.
+ *
+ * Capture devices declare a nominal rate, often 60 fps, even when the source
+ * runs at 59.94 fps (NTSC video). RetroArch then calls retro_run() at 60 Hz
+ * while frames arrive at 59.94 Hz, and a frame is lost every 17 seconds or so.
+ * The rate is measured from the frame sequence numbers and arrival times over
+ * at least RATE_MIN_USEC; when it matches the nominal rate or its NTSC
+ * variant (x1000/1001 or x1001/1000) better than the rate reported so far, that
+ * rate is reported instead. With a variable refresh rate display, RetroArch
+ * then follows the source exactly.
+ *
+ * Once the rates match, the moment frames arrive relative to retro_run()
+ * stays where it was when the rate changed. The change is therefore made only
+ * when frames arrive halfway between two calls, far from the collision zone
+ * described in pick_frame().
+ */
+static double measure_frame_rate(const capture_frame_t *frame)
+{
+   double candidates[3], measured;
+   int i;
+
+   if (!frame->arrival_usec)
+      return frame->frame_rate;
+
+   /* New device format: start over from the declared rate. */
+   if (frame->frame_rate != rate_nominal)
+   {
+      rate_nominal         = frame->frame_rate;
+      rate_reported        = frame->frame_rate;
+      rate_anchor_sequence = 0;
+   }
+
+   /* First frame, or frames stopped for a while (signal lost): restart the
+    * measurement, keeping the rate reported so far. */
+   if (!rate_anchor_sequence || frame->sequence <= rate_last_sequence ||
+       frame->arrival_usec - rate_last_usec > RATE_GAP_USEC)
+   {
+      rate_anchor_sequence = frame->sequence;
+      rate_anchor_usec     = frame->arrival_usec;
+   }
+
+   rate_last_sequence = frame->sequence;
+   rate_last_usec     = frame->arrival_usec;
+
+   if (frame->arrival_usec - rate_anchor_usec < RATE_MIN_USEC)
+      return rate_reported;
+
+   measured = (double)(frame->sequence - rate_anchor_sequence) * 1000000.0 /
+              (double)(frame->arrival_usec - rate_anchor_usec);
+
+   candidates[0] = rate_nominal;
+   candidates[1] = rate_nominal * 1000.0 / 1001.0;
+   candidates[2] = rate_nominal * 1001.0 / 1000.0;
+
+   /* Wait for frames to arrive halfway between two calls. */
+   {
+      const double age_ms    = (double)(capture_time_usec() - frame->arrival_usec) / 1000.0;
+      const double period_ms = 1000.0 / output_fps;
+
+      if (age_ms < period_ms * 0.3 || age_ms > period_ms * 0.7)
+         return rate_reported;
+   }
+
+   for (i = 0; i < 3; i++)
+   {
+      if (candidates[i] != rate_reported && fabs(measured / candidates[i] - 1.0) <= RATE_TOLERANCE)
+      {
+         rate_reported = candidates[i];
+         log_cb(RETRO_LOG_INFO, LOG_PREFIX "Measured frame rate: %.3f fps (device declares %.3f).\n",
+               measured, rate_nominal);
+         stats_log_printf("Measured frame rate: %.3f fps (device declares %.3f), reporting %.3f fps to RetroArch.",
+               measured, rate_nominal, rate_reported);
+         break;
+      }
+   }
+
+   return rate_reported;
 }
 
 /* Makes sure rgb_buffer holds at least `pixels` pixels. */
@@ -1303,7 +1456,7 @@ static enum signal_state poll_capture(bool *new_frame)
          frame_age_count++;
       }
       *new_frame = true;
-      update_frame_rate(frame.frame_rate);
+      update_frame_rate(measure_frame_rate(&frame));
    }
    else
    {
@@ -1435,18 +1588,21 @@ RETRO_API void retro_reset(void)
    apply_device_selection(true);
 }
 
-/* Detects pauses (RetroArch's menu) from the time since the previous call.
- * A pause restarts the current stats second, excludes the pause from the
- * session summary, and makes the core resume on the newest frame. */
+/* Detects pauses (RetroArch's menu, shader setup) from the time since the
+ * previous call. A pause restarts the current stats second, excludes the
+ * pause from the session summary, and makes the core resume on the newest
+ * frame. */
 static void detect_pause(void)
 {
    const retro_time_t now  = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
    const uint64_t received = capture_frames_received();
+   const bool first_run    = waiting_first_run;
 
+   waiting_first_run = false;
    if (!now)
       return;
 
-   if (last_run_usec && now - last_run_usec > PAUSE_THRESHOLD_USEC)
+   if (last_run_usec && now - last_run_usec >= STALL_THRESHOLD_USEC)
    {
       const retro_time_t gap = now - last_run_usec;
 
@@ -1454,7 +1610,14 @@ static void detect_pause(void)
       session_paused_frames += received >= last_run_received ? received - last_run_received : 0;
       stats_last_time        = 0; /* Restart the stats second */
       pacing_resync          = true;
-      stats_log_printf("Paused for %.1f s.", (double)gap / 1000000.0);
+
+      if (first_run)
+         stats_log_printf("RetroArch started running the core %.1f s after the device opened.",
+               (double)gap / 1000000.0);
+      else if (gap >= PAUSE_THRESHOLD_USEC)
+         stats_log_printf("Paused for %.1f s.", (double)gap / 1000000.0);
+      else
+         stats_log_printf("RetroArch stalled for %.0f ms.", (double)gap / 1000.0);
    }
 
    last_run_usec     = now;
@@ -1465,8 +1628,8 @@ RETRO_API void retro_run(void)
 {
    bool updated = false;
 
-   session_runs++;
    detect_pause();
+   session_runs++;
 
    if (input_poll_cb)
       input_poll_cb();
@@ -1474,6 +1637,7 @@ RETRO_API void retro_run(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
       read_options();
+      log_options(false);
       update_stats_log_file();
       apply_device_selection(false);
       screen_key[0] = '\0';
