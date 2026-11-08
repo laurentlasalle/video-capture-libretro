@@ -3,8 +3,9 @@
  * A libretro core that displays a live video capture device (capture card,
  * HDMI grabber, webcam) so RetroArch shaders can be applied to it.
  *
- * The core runs without content. It shows the selected capture device, or an
- * animated test pattern when no device is available or no frame arrives.
+ * The core runs without content, or with a .vidcap file: an empty file that
+ * lets RetroArch save core options and shader presets per "game", for example
+ * one file per console or VCR connected to the capture device.
  *
  * Copyright (c) 2026 Laurent LaSalle
  * SPDX-License-Identifier: MIT
@@ -12,34 +13,50 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
 
 #include "libretro.h"
 #include "capture.h"
+#include "convert.h"
+#include "font.h"
 #include "scale.h"
 
 #ifndef CORE_VERSION
 #define CORE_VERSION "0.0.0"
 #endif
 
-#define CORE_NAME     "Video Capture Device"
-#define LOG_PREFIX    "[Video Capture Device] "
+#define CORE_NAME  "Video Capture Device"
+#define LOG_PREFIX "[Video Capture Device] "
 
-#define PATTERN_WIDTH  640
-#define PATTERN_HEIGHT 480
-#define DEFAULT_FPS    60.0
-#define SAMPLE_RATE    48000.0
+#define SCREEN_WIDTH  640 /* No Signal screen size */
+#define SCREEN_HEIGHT 480
+#define DEFAULT_FPS   60.0
+#define SAMPLE_RATE   48000.0
 #define AUDIO_FRAMES_MAX 4800 /* Silence buffer: enough for frame rates down to 10 fps */
 
-/* Frames without a new capture frame before falling back to the test pattern. */
-#define SIGNAL_TIMEOUT_FRAMES 120
+/* Seconds without frames before showing the No Signal screen. */
+#define NO_FRAMES_TIMEOUT 2.0
+/* Seconds of uniformly black frames before showing the No Signal screen. */
+#define BLACK_TIMEOUT     1.0
+/* Seconds between attempts to reopen a device that failed. */
+#define RETRY_INTERVAL    3.0
 
-#define OPTION_DEVICE     "video_capture_device"
-#define OPTION_RESOLUTION "video_capture_resolution"
-#define OPTION_ASPECT     "video_capture_aspect"
-#define DEVICE_AUTO       "auto"
+/* ------------------------------------------------------------------------ */
+/* Core options                                                              */
+/* ------------------------------------------------------------------------ */
+
+#define OPTION_DEVICE      "video_capture_device"
+#define OPTION_RESOLUTION  "video_capture_resolution"
+#define OPTION_ASPECT      "video_capture_aspect"
+#define OPTION_CONVERSION  "video_capture_conversion"
+#define OPTION_COLOR_SPACE "video_capture_color_space"
+#define OPTION_COLOR_RANGE "video_capture_color_range"
+#define OPTION_STATS       "video_capture_stats"
+#define OPTION_DETAILS     "video_capture_no_signal_details"
+#define DEVICE_AUTO        "auto"
 
 enum output_resolution
 {
@@ -56,6 +73,33 @@ enum aspect_mode
    ASPECT_16_9         /* Full frame, displayed as 16:9 */
 };
 
+enum color_space_option
+{
+   COLOR_SPACE_DEFAULT = 0, /* Rec. 601 up to 576 lines, Rec. 709 above */
+   COLOR_SPACE_REC709,
+   COLOR_SPACE_REC601
+};
+
+enum stats_mode
+{
+   STATS_OFF = 0,
+   STATS_NOTIFICATION, /* RetroArch on-screen notification */
+   STATS_IMAGE         /* Drawn into the image, before shaders */
+};
+
+/* Current option values */
+static enum output_resolution  opt_resolution  = RESOLUTION_NATIVE;
+static enum aspect_mode        opt_aspect      = ASPECT_SOURCE;
+static bool                    opt_core_convert = true;
+static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
+static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
+static enum stats_mode         opt_stats       = STATS_OFF;
+static bool                    opt_details     = false;
+
+/* ------------------------------------------------------------------------ */
+/* State                                                                     */
+/* ------------------------------------------------------------------------ */
+
 /* Frontend callbacks */
 static retro_environment_t        environ_cb;
 static retro_video_refresh_t      video_cb;
@@ -64,45 +108,68 @@ static retro_audio_sample_batch_t audio_batch_cb;
 static retro_input_poll_t         input_poll_cb;
 static retro_input_state_t        input_state_cb;
 static retro_log_printf_t         log_cb;
+static struct retro_perf_callback perf_cb;
+static unsigned                   message_interface_version;
+static bool                       can_dupe;
 
-/* Test pattern: the static image, and the copy shown with the sweeping line */
-static uint32_t pattern_base[PATTERN_WIDTH * PATTERN_HEIGHT];
-static uint32_t pattern_buffer[PATTERN_WIDTH * PATTERN_HEIGHT];
-static int      pattern_line_y = -1; /* Row where the sweeping line is drawn, -1 if none */
-static int16_t  silence[AUDIO_FRAMES_MAX * 2];
-static double   audio_frames_pending; /* Fractional audio frames carried between video frames */
-static uint64_t frame_count;
-
-/* Capture state */
+/* Devices */
 static capture_device_t devices[CAPTURE_MAX_DEVICES];
 static int              device_count;
 static char             active_device_id[sizeof(devices[0].id)];
-static capture_frame_t  capture_frame;          /* Last frame received from the device */
-static unsigned         frames_without_capture;
-static bool             showing_capture;
-static bool             can_dupe;
+static const char      *active_device_name = "";
+static bool             active_core_convert; /* Conversion mode the device was opened with */
+static double           retry_timer;         /* Seconds until the next reopen attempt */
 
-/* Image processing. Scaled output is at most 640x480. */
-static uint32_t               scaled_buffer[640 * 480];
-static enum output_resolution resolution_option = RESOLUTION_NATIVE;
-static enum aspect_mode       aspect_option     = ASPECT_SOURCE;
+/* Why the No Signal screen is shown, if it is. */
+enum signal_state
+{
+   SIGNAL_OK = 0,
+   SIGNAL_NO_DEVICE,   /* No capture device found */
+   SIGNAL_DEVICE_ERROR,/* The device could not be opened, or stopped with an error */
+   SIGNAL_NO_FRAMES,   /* The device is open but sends no frames */
+   SIGNAL_BLACK        /* The device sends uniformly black frames: no input signal */
+};
 
-/* Geometry currently reported to the frontend */
-static unsigned output_width  = PATTERN_WIDTH;
-static unsigned output_height = PATTERN_HEIGHT;
-static float    output_aspect = 4.0f / 3.0f;
-static double   output_fps    = DEFAULT_FPS;
+/* Capture */
+static capture_frame_t last_frame;     /* Last frame received; valid while have_frame */
+static bool            have_frame;
+static double          seconds_without_frame;
+static double          seconds_black;
 
-/* Last frame sent, repeated when the device has no new frame yet */
+/* Output */
+static uint32_t       *rgb_buffer;      /* Converted or scaled image */
+static size_t          rgb_buffer_size; /* In pixels */
+static uint32_t        screen_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+static char            screen_key[1024]; /* Content of the No Signal screen last drawn */
 static const uint32_t *last_output;
-static size_t          last_output_pitch; /* In bytes */
+static size_t          last_output_pitch;
+static unsigned        output_width  = SCREEN_WIDTH;
+static unsigned        output_height = SCREEN_HEIGHT;
+static float           output_aspect = 4.0f / 3.0f;
+static double          output_fps    = DEFAULT_FPS;
+
+/* Audio */
+static int16_t silence[AUDIO_FRAMES_MAX * 2];
+static double  audio_frames_pending; /* Fractional audio frames carried between video frames */
+
+/* Stats */
+static retro_time_t stats_last_time;
+static uint64_t     stats_last_received;
+static uint64_t     stats_frames_shown;
+static double       stats_capture_fps;
+static double       stats_output_fps;
+static char         stats_lines[2][96];
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
-static struct retro_core_option_v2_definition option_definitions[4];
+static struct retro_core_option_v2_definition option_definitions[9];
 static struct retro_core_option_v2_category   option_categories[1];
 static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
-static struct retro_variable legacy_variables[4];
+static struct retro_variable legacy_variables[9];
+
+/* ------------------------------------------------------------------------ */
+/* Logging                                                                   */
+/* ------------------------------------------------------------------------ */
 
 /* Fallback logger used when the frontend does not provide one. */
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
@@ -132,66 +199,6 @@ static void capture_logger(enum capture_log_level level, const char *message)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Test pattern                                                              */
-/* ------------------------------------------------------------------------ */
-
-/* 75% SMPTE color bars: white, yellow, cyan, green, magenta, red, blue. */
-static const uint32_t bar_colors[7] = {
-   0xBFBFBF, 0xBFBF00, 0x00BFBF, 0x00BF00, 0xBF00BF, 0xBF0000, 0x0000BF
-};
-
-/* Draws the static part of the test pattern once: color bars over a
- * black-to-white luminance ramp. */
-static void init_test_pattern(void)
-{
-   const int bars_height = (PATTERN_HEIGHT * 2) / 3;
-   int x, y;
-
-   for (y = 0; y < PATTERN_HEIGHT; y++)
-   {
-      uint32_t *row = &pattern_base[y * PATTERN_WIDTH];
-
-      for (x = 0; x < PATTERN_WIDTH; x++)
-      {
-         if (y < bars_height)
-            row[x] = bar_colors[(x * 7) / PATTERN_WIDTH];
-         else
-         {
-            uint32_t v = (uint32_t)((x * 255) / (PATTERN_WIDTH - 1));
-            row[x] = (v << 16) | (v << 8) | v;
-         }
-      }
-   }
-
-   memcpy(pattern_buffer, pattern_base, sizeof(pattern_buffer));
-   pattern_line_y = -1;
-}
-
-/* Moves the white line that sweeps down the screen once per second, so a
- * frozen image or uneven pacing is easy to spot. Only the two rows the line
- * leaves and the two rows it enters are rewritten. */
-static void update_test_pattern(void)
-{
-   const uint64_t fps = (uint64_t)(output_fps + 0.5);
-   const int line_y   = (int)((frame_count % fps) * (PATTERN_HEIGHT - 1) / fps);
-   const size_t two_rows = 2 * PATTERN_WIDTH * sizeof(uint32_t);
-   int x;
-
-   if (line_y == pattern_line_y)
-      return;
-
-   /* Restore the rows under the previous line. */
-   if (pattern_line_y >= 0)
-      memcpy(&pattern_buffer[pattern_line_y * PATTERN_WIDTH],
-            &pattern_base[pattern_line_y * PATTERN_WIDTH], two_rows);
-
-   for (x = 0; x < 2 * PATTERN_WIDTH; x++)
-      pattern_buffer[line_y * PATTERN_WIDTH + x] = 0xFFFFFF;
-
-   pattern_line_y = line_y;
-}
-
-/* ------------------------------------------------------------------------ */
 /* Core options                                                              */
 /* ------------------------------------------------------------------------ */
 
@@ -218,13 +225,51 @@ static void refresh_device_list(void)
          snprintf(option_device_names[i], sizeof(option_device_names[i]), "%.255s", devices[i].name);
    }
 
-   if (log_cb)
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d capture device(s) found.\n", device_count);
+   for (i = 0; i < device_count; i++)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_device_names[i]);
+}
+
+/* Fills one option definition. `values` alternates value and label (NULL
+ * label: the value is shown) and ends with NULL. */
+static void define_option(struct retro_core_option_v2_definition *def, const char *key,
+      const char *desc, const char *info, const char *default_value, const char *const *values)
+{
+   int i;
+
+   def->key           = key;
+   def->desc          = desc;
+   def->info          = info;
+   def->default_value = default_value;
+   for (i = 0; values[i * 2]; i++)
    {
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d capture device(s) found.\n", device_count);
-      for (i = 0; i < device_count; i++)
-         log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_device_names[i]);
+      def->values[i].value = values[i * 2];
+      def->values[i].label = values[i * 2 + 1];
    }
 }
+
+static const char *const resolution_values[] = {
+   "native", "Native", "640x480", NULL, "320x240", NULL, NULL
+};
+static const char *const aspect_values[] = {
+   "source", "Source", "4_3_squash", "4:3 (Squash)", "4_3_crop", "4:3 (Crop Pillarbox)",
+   "16_9", "16:9", NULL
+};
+static const char *const conversion_values[] = {
+   "core", "Core", "media_foundation", "Media Foundation", NULL
+};
+static const char *const color_space_values[] = {
+   "default", "Default", "rec709", "Rec. 709", "rec601", "Rec. 601", NULL
+};
+static const char *const color_range_values[] = {
+   "limited", "Limited", "full", "Full", NULL
+};
+static const char *const stats_values[] = {
+   "off", "Off", "notification", "On-Screen Notification", "image", "In Image", NULL
+};
+static const char *const details_values[] = {
+   "off", "Off", "on", "On", NULL
+};
 
 static void declare_core_options(void)
 {
@@ -237,8 +282,8 @@ static void declare_core_options(void)
    if (version >= 2)
    {
       struct retro_core_options_v2 options;
-      struct retro_core_option_v2_definition *def = &option_definitions[0];
-      int max_devices = RETRO_NUM_CORE_OPTION_VALUES_MAX - 2;
+      struct retro_core_option_v2_definition *def = option_definitions;
+      const int max_devices = RETRO_NUM_CORE_OPTION_VALUES_MAX - 2;
 
       memset(option_definitions, 0, sizeof(option_definitions));
       memset(option_categories, 0, sizeof(option_categories));
@@ -250,42 +295,52 @@ static void declare_core_options(void)
       def->values[0].value = DEVICE_AUTO;
       def->values[0].label = "Auto (first device)";
       for (i = 0; i < device_count && i < max_devices; i++)
-      {
          def->values[i + 1].value = option_device_names[i];
-         def->values[i + 1].label = NULL;
-      }
       def->default_value = DEVICE_AUTO;
+      def++;
 
-      def = &option_definitions[1];
-      def->key  = OPTION_RESOLUTION;
-      def->desc = "Output Resolution";
-      def->info = "Resolution of the image passed to RetroArch and its shaders. "
-                  "CRT and VHS shaders expect a low resolution such as 640x480 or 320x240. "
-                  "Downscaling averages the source pixels to avoid aliasing.";
-      def->values[0].value = "native";
-      def->values[0].label = "Native";
-      def->values[1].value = "640x480";
-      def->values[1].label = NULL;
-      def->values[2].value = "320x240";
-      def->values[2].label = NULL;
-      def->default_value = "native";
+      define_option(def++, OPTION_RESOLUTION, "Output Resolution",
+            "Resolution of the image passed to RetroArch and its shaders. "
+            "CRT and VHS shaders expect a low resolution such as 640x480 or 320x240. "
+            "Downscaling averages the source pixels to avoid aliasing.",
+            "native", resolution_values);
 
-      def = &option_definitions[2];
-      def->key  = OPTION_ASPECT;
-      def->desc = "Aspect Ratio";
-      def->info = "Display aspect ratio reported to RetroArch. "
-                  "4:3 (Squash) keeps the whole frame, for a 4:3 picture stretched to 16:9. "
-                  "4:3 (Crop Pillarbox) keeps only the central 4:3 area, for a picture with black bars on the sides. "
-                  "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.";
-      def->values[0].value = "source";
-      def->values[0].label = "Source";
-      def->values[1].value = "4_3_squash";
-      def->values[1].label = "4:3 (Squash)";
-      def->values[2].value = "4_3_crop";
-      def->values[2].label = "4:3 (Crop Pillarbox)";
-      def->values[3].value = "16_9";
-      def->values[3].label = "16:9";
-      def->default_value = "source";
+      define_option(def++, OPTION_ASPECT, "Aspect Ratio",
+            "Display aspect ratio reported to RetroArch. "
+            "4:3 (Squash) keeps the whole frame, for a 4:3 picture stretched to 16:9. "
+            "4:3 (Crop Pillarbox) keeps only the central 4:3 area, for a picture with black bars on the sides. "
+            "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.",
+            "source", aspect_values);
+
+      define_option(def++, OPTION_CONVERSION, "Color Conversion",
+            "Converts the device's YUV picture to the RGB format RetroArch needs. "
+            "Core converts after downscaling, which is faster at 640x480 and 320x240, "
+            "and applies the Color Space and Color Range options. "
+            "Media Foundation converts the full frame with Windows; Color Space and Color Range are then ignored. "
+            "Changing this option reopens the device.",
+            "core", conversion_values);
+
+      define_option(def++, OPTION_COLOR_SPACE, "Color Space",
+            "Color matrix used to convert YUV to RGB. Default uses Rec. 601 up to 576 lines and Rec. 709 above. "
+            "Applies only when Color Conversion is set to Core.",
+            "default", color_space_values);
+
+      define_option(def++, OPTION_COLOR_RANGE, "Color Range",
+            "Limited is standard for video: black is at level 16 and white at 235. "
+            "Use Full if blacks look gray or colors look washed out. "
+            "Applies only when Color Conversion is set to Core.",
+            "limited", color_range_values);
+
+      define_option(def++, OPTION_STATS, "Show Capture Stats",
+            "Shows the frame rate received from the device and the frame rate shown, with the image sizes. "
+            "If the output frame rate is lower than the capture frame rate, frames are being dropped. "
+            "On-Screen Notification uses RetroArch's notifications. "
+            "In Image draws the text into the picture, before shaders.",
+            "off", stats_values);
+
+      define_option(def++, OPTION_DETAILS, "No Signal Details",
+            "Shows the reason and troubleshooting hints on the No Signal screen.",
+            "off", details_values);
 
       options.categories  = option_categories;
       options.definitions = option_definitions;
@@ -293,7 +348,7 @@ static void declare_core_options(void)
    }
    else
    {
-      /* Legacy format: "Description; value1|value2|...". */
+      /* Legacy format: "Description; value1|value2|...", first value is the default. */
       size_t len = (size_t)snprintf(legacy_device_values, sizeof(legacy_device_values),
             "Capture Device; %s", DEVICE_AUTO);
 
@@ -307,98 +362,131 @@ static void declare_core_options(void)
       legacy_variables[1].value = "Output Resolution; native|640x480|320x240";
       legacy_variables[2].key   = OPTION_ASPECT;
       legacy_variables[2].value = "Aspect Ratio; source|4_3_squash|4_3_crop|16_9";
-      legacy_variables[3].key   = NULL;
-      legacy_variables[3].value = NULL;
+      legacy_variables[3].key   = OPTION_CONVERSION;
+      legacy_variables[3].value = "Color Conversion; core|media_foundation";
+      legacy_variables[4].key   = OPTION_COLOR_SPACE;
+      legacy_variables[4].value = "Color Space; default|rec709|rec601";
+      legacy_variables[5].key   = OPTION_COLOR_RANGE;
+      legacy_variables[5].value = "Color Range; limited|full";
+      legacy_variables[6].key   = OPTION_STATS;
+      legacy_variables[6].value = "Show Capture Stats; off|notification|image";
+      legacy_variables[7].key   = OPTION_DETAILS;
+      legacy_variables[7].value = "No Signal Details; off|on";
+      legacy_variables[8].key   = NULL;
+      legacy_variables[8].value = NULL;
       environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, legacy_variables);
    }
 }
 
-/* Returns the id of the device selected in the core options, or NULL. */
-static const char *selected_device_id(void)
+/* Returns the value of an option, or NULL if the frontend has none. */
+static const char *get_option(const char *key)
 {
    struct retro_variable var;
+
+   var.key   = key;
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
+      return var.value;
+   return NULL;
+}
+
+static bool option_is(const char *value, const char *expected)
+{
+   return value && strcmp(value, expected) == 0;
+}
+
+/* Reads every option except the device, which apply_device_selection() handles. */
+static void read_options(void)
+{
+   const char *value;
+
+   value = get_option(OPTION_RESOLUTION);
+   opt_resolution = option_is(value, "640x480") ? RESOLUTION_640X480
+                  : option_is(value, "320x240") ? RESOLUTION_320X240
+                  : RESOLUTION_NATIVE;
+
+   value = get_option(OPTION_ASPECT);
+   opt_aspect = option_is(value, "4_3_squash") ? ASPECT_4_3_SQUASH
+              : option_is(value, "4_3_crop")   ? ASPECT_4_3_CROP
+              : option_is(value, "16_9")       ? ASPECT_16_9
+              : ASPECT_SOURCE;
+
+   opt_core_convert = !option_is(get_option(OPTION_CONVERSION), "media_foundation");
+
+   value = get_option(OPTION_COLOR_SPACE);
+   opt_color_space = option_is(value, "rec709") ? COLOR_SPACE_REC709
+                   : option_is(value, "rec601") ? COLOR_SPACE_REC601
+                   : COLOR_SPACE_DEFAULT;
+
+   opt_color_range = option_is(get_option(OPTION_COLOR_RANGE), "full") ? COLOR_RANGE_FULL : COLOR_RANGE_LIMITED;
+
+   value = get_option(OPTION_STATS);
+   opt_stats = option_is(value, "notification") ? STATS_NOTIFICATION
+             : option_is(value, "image")        ? STATS_IMAGE
+             : STATS_OFF;
+
+   opt_details = option_is(get_option(OPTION_DETAILS), "on");
+}
+
+/* Returns the index of the device selected in the core options, or -1. */
+static int selected_device_index(void)
+{
+   const char *value = get_option(OPTION_DEVICE);
    int i;
 
    if (device_count == 0)
-      return NULL;
+      return -1;
 
-   var.key   = OPTION_DEVICE;
-   var.value = NULL;
-
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
-       strcmp(var.value, DEVICE_AUTO) != 0)
+   if (value && strcmp(value, DEVICE_AUTO) != 0)
    {
       for (i = 0; i < device_count; i++)
-         if (strcmp(var.value, option_device_names[i]) == 0)
-            return devices[i].id;
+         if (strcmp(value, option_device_names[i]) == 0)
+            return i;
 
-      if (log_cb)
-         log_cb(RETRO_LOG_WARN, LOG_PREFIX "Device \"%s\" not found, using the first device.\n", var.value);
+      log_cb(RETRO_LOG_WARN, LOG_PREFIX "Device \"%s\" not found, using the first device.\n", value);
    }
 
-   return devices[0].id;
+   return 0;
 }
 
-/* Reads the resolution and aspect ratio options. */
-static void read_image_options(void)
-{
-   struct retro_variable var;
-
-   var.key   = OPTION_RESOLUTION;
-   var.value = NULL;
-   resolution_option = RESOLUTION_NATIVE;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (strcmp(var.value, "640x480") == 0)
-         resolution_option = RESOLUTION_640X480;
-      else if (strcmp(var.value, "320x240") == 0)
-         resolution_option = RESOLUTION_320X240;
-   }
-
-   var.key   = OPTION_ASPECT;
-   var.value = NULL;
-   aspect_option = ASPECT_SOURCE;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (strcmp(var.value, "4_3_squash") == 0)
-         aspect_option = ASPECT_4_3_SQUASH;
-      else if (strcmp(var.value, "4_3_crop") == 0)
-         aspect_option = ASPECT_4_3_CROP;
-      else if (strcmp(var.value, "16_9") == 0)
-         aspect_option = ASPECT_16_9;
-   }
-}
-
-/* Opens the selected device if it differs from the active one. */
+/* Opens the selected device. Without `force`, does nothing if the device and
+ * conversion mode are unchanged. */
 static void apply_device_selection(bool force)
 {
-   const char *id = selected_device_id();
+   const int index = selected_device_index();
 
-   if (!id)
+   if (index < 0)
    {
-      if (log_cb)
-         log_cb(RETRO_LOG_WARN, LOG_PREFIX "No capture device found, showing the test pattern.\n");
+      active_device_id[0] = '\0';
+      active_device_name  = "";
       return;
    }
 
-   if (!force && strcmp(id, active_device_id) == 0)
+   if (!force && strcmp(devices[index].id, active_device_id) == 0 &&
+       active_core_convert == opt_core_convert)
       return;
 
-   snprintf(active_device_id, sizeof(active_device_id), "%s", id);
-   showing_capture        = false;
-   frames_without_capture = 0;
+   snprintf(active_device_id, sizeof(active_device_id), "%s", devices[index].id);
+   active_device_name    = option_device_names[index];
+   active_core_convert   = opt_core_convert;
+   have_frame            = false;
+   seconds_without_frame = 0.0;
+   seconds_black         = 0.0;
+   retry_timer           = RETRY_INTERVAL;
 
-   if (capture_start(id))
-   {
-      if (log_cb)
-         log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started.\n");
-   }
-   else if (log_cb)
-      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture, showing the test pattern.\n");
+   if (capture_start(devices[index].id, opt_core_convert))
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
+   else
+      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s\n", capture_last_error());
+
+   stats_last_time     = 0; /* Restart the stats measurement */
+   stats_frames_shown  = 0;
+   stats_capture_fps   = 0.0;
+   stats_output_fps    = 0.0;
 }
 
 /* ------------------------------------------------------------------------ */
-/* Output                                                                    */
+/* Frontend geometry and timing                                              */
 /* ------------------------------------------------------------------------ */
 
 /* Tells the frontend when the output size or display aspect ratio changes. */
@@ -420,8 +508,7 @@ static void set_output_geometry(unsigned width, unsigned height, float aspect)
    geometry.aspect_ratio = aspect;
    environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 
-   if (log_cb)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
 }
 
 /* Returns `fps` if plausible, otherwise the current output rate. */
@@ -435,7 +522,7 @@ static double valid_fps(double fps)
 static void update_frame_rate(double device_rate)
 {
    struct retro_system_av_info av_info;
-   double fps = valid_fps(device_rate);
+   const double fps = valid_fps(device_rate);
 
    if (fps == output_fps)
       return;
@@ -452,30 +539,317 @@ static void update_frame_rate(double device_rate)
    av_info.timing.sample_rate    = SAMPLE_RATE;
    environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
 
-   if (log_cb)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frame rate: %.3f fps.\n", output_fps);
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frame rate: %.3f fps.\n", output_fps);
 }
 
-/* Applies the crop, resolution and aspect ratio options to a captured frame,
- * then sends it to the frontend. */
+/* Makes sure rgb_buffer holds at least `pixels` pixels. */
+static bool reserve_rgb_buffer(size_t pixels)
+{
+   uint32_t *buffer;
+
+   if (pixels <= rgb_buffer_size)
+      return true;
+
+   buffer = (uint32_t *)realloc(rgb_buffer, pixels * sizeof(uint32_t));
+   if (!buffer)
+   {
+      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Out of memory.\n");
+      return false;
+   }
+
+   rgb_buffer      = buffer;
+   rgb_buffer_size = pixels;
+   return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Stats                                                                     */
+/* ------------------------------------------------------------------------ */
+
+static const char *format_name(enum capture_format format)
+{
+   switch (format)
+   {
+      case CAPTURE_FORMAT_NV12: return "NV12";
+      case CAPTURE_FORMAT_YUY2: return "YUY2";
+      default:                  return "RGB";
+   }
+}
+
+/* Measures the capture and output frame rates about once per second and
+ * updates the stats text. */
+static void update_stats(void)
+{
+   const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const uint64_t received = capture_frames_received();
+   double seconds;
+
+   if (!now)
+      return;
+
+   if (!stats_last_time)
+   {
+      stats_last_time     = now;
+      stats_last_received = received;
+      stats_frames_shown  = 0;
+      return;
+   }
+
+   seconds = (double)(now - stats_last_time) / 1000000.0;
+   if (seconds < 1.0)
+      return;
+
+   stats_capture_fps   = (double)(received - stats_last_received) / seconds;
+   stats_output_fps    = (double)stats_frames_shown / seconds;
+   stats_last_time     = now;
+   stats_last_received = received;
+   stats_frames_shown  = 0;
+
+   snprintf(stats_lines[0], sizeof(stats_lines[0]), "Capture: %6.2f fps  %ux%u %s",
+         stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format));
+   snprintf(stats_lines[1], sizeof(stats_lines[1]), "Output:  %6.2f fps  %ux%u",
+         stats_output_fps, output_width, output_height);
+
+   if (opt_stats == STATS_NOTIFICATION)
+   {
+      char text[200];
+
+      snprintf(text, sizeof(text), "Capture %.2f fps (%ux%u %s) | Output %.2f fps (%ux%u)",
+            stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format),
+            stats_output_fps, output_width, output_height);
+
+      if (message_interface_version >= 1)
+      {
+         struct retro_message_ext message;
+
+         message.msg      = text;
+         message.duration = 2000; /* Milliseconds; refreshed every second */
+         message.priority = 1;
+         message.level    = RETRO_LOG_INFO;
+         message.target   = RETRO_MESSAGE_TARGET_OSD;
+         message.type     = RETRO_MESSAGE_TYPE_STATUS;
+         message.progress = -1;
+         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
+      }
+      else
+      {
+         struct retro_message message;
+
+         message.msg    = text;
+         message.frames = (unsigned)(output_fps * 2.0);
+         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+      }
+   }
+}
+
+/* Draws the stats in the top-left corner of an output image, on a dark box
+ * so the text stays readable over any picture. */
+static void draw_stats_overlay(uint32_t *image, size_t pitch, unsigned width, unsigned height)
+{
+   /* Text height about 1/30 of the image: 8 px at 240 lines, 32 px at 1080. */
+   const unsigned scale = height >= 240 ? height / 240 : 1;
+   const unsigned line_height = (FONT_GLYPH_SIZE + 2) * scale;
+   const unsigned margin = 2 * scale;
+   unsigned box_width = font_text_width(stats_lines[0], scale);
+   unsigned w1 = font_text_width(stats_lines[1], scale);
+   int i;
+
+   if (!stats_lines[0][0])
+      return;
+   if (w1 > box_width)
+      box_width = w1;
+
+   font_fill_rect(image, pitch, width, height, 0, 0,
+         (int)(box_width + 2 * margin), (int)(2 * line_height + 2 * margin), 0x101010);
+   for (i = 0; i < 2; i++)
+      font_draw_text(image, pitch, width, height, (int)margin, (int)(margin + i * line_height),
+            stats_lines[i], scale, 0xFFFF40);
+}
+
+/* ------------------------------------------------------------------------ */
+/* No Signal screen                                                          */
+/* ------------------------------------------------------------------------ */
+
+/* 75% SMPTE color bars: white, yellow, cyan, green, magenta, red, blue. */
+static const uint32_t bar_colors[7] = {
+   0xBFBFBF, 0xBFBF00, 0x00BFBF, 0x00BF00, 0xBF00BF, 0xBF0000, 0x0000BF
+};
+
+/* Splits `text` into lines of at most `max_chars` characters, breaking at
+ * spaces. Returns the number of lines written to `lines`. */
+static int wrap_text(const char *text, unsigned max_chars, char lines[][96], int max_lines)
+{
+   int count = 0;
+
+   while (*text && count < max_lines)
+   {
+      size_t len = strlen(text);
+      size_t cut = len;
+
+      if (len > max_chars)
+      {
+         cut = max_chars;
+         while (cut > 0 && text[cut] != ' ')
+            cut--;
+         if (cut == 0)
+            cut = max_chars; /* A single word longer than a line */
+      }
+
+      if (cut > 95)
+         cut = 95;
+      memcpy(lines[count], text, cut);
+      lines[count][cut] = '\0';
+      count++;
+
+      text += cut;
+      while (*text == ' ')
+         text++;
+   }
+
+   return count;
+}
+
+/* Draws text centered horizontally at row y. */
+static void draw_centered(const char *text, int y, unsigned scale, uint32_t color)
+{
+   const int x = ((int)SCREEN_WIDTH - (int)font_text_width(text, scale)) / 2;
+   font_draw_text(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
+         x, y, text, scale, color);
+}
+
+/* Returns the reason text and a troubleshooting hint for a signal state. */
+static void describe_signal_state(enum signal_state state, char *reason, size_t reason_size,
+      char *hint, size_t hint_size)
+{
+   switch (state)
+   {
+      case SIGNAL_NO_DEVICE:
+         snprintf(reason, reason_size, "No capture device was found.");
+         snprintf(hint, hint_size, "Connect the device, then restart the core. "
+               "Devices are detected when the core starts.");
+         break;
+      case SIGNAL_DEVICE_ERROR:
+         snprintf(reason, reason_size, "%s", capture_last_error()[0]
+               ? capture_last_error() : "The device could not be opened.");
+         snprintf(hint, hint_size, "The core tries to reopen the device every few seconds.");
+         break;
+      case SIGNAL_BLACK:
+         snprintf(reason, reason_size, "The device is connected, but receives no picture from its source.");
+         snprintf(hint, hint_size, "Check that the source is turned on, that its cable is plugged into "
+               "the input selected in Capture Device, and that its output resolution is supported.");
+         break;
+      case SIGNAL_NO_FRAMES:
+      default:
+         snprintf(reason, reason_size, "The device is open, but sends no frames.");
+         snprintf(hint, hint_size, "Check the source and its cable. If the problem persists, "
+               "try Color Conversion set to Media Foundation, or reconnect the device.");
+         break;
+   }
+}
+
+/* Draws the No Signal screen: color bars with a black panel in the middle
+ * showing the title, the device name and, optionally, the details. The screen
+ * is redrawn only when its content changes. */
+static void render_no_signal_screen(enum signal_state state)
+{
+   const char *title = state == SIGNAL_NO_DEVICE ? "NO DEVICE"
+                     : state == SIGNAL_DEVICE_ERROR ? "DEVICE ERROR"
+                     : "NO SIGNAL";
+   char reason[512], hint[512], key[sizeof(screen_key)];
+   char lines[12][96];
+   const int bars_height = (SCREEN_HEIGHT * 2) / 3;
+   const int panel_x = 40, panel_w = SCREEN_WIDTH - 80;
+   int line_count = 0, panel_h, panel_y, y, x, i;
+
+   describe_signal_state(state, reason, sizeof(reason), hint, sizeof(hint));
+   snprintf(key, sizeof(key), "%d|%d|%s|%s", (int)state, (int)opt_details, active_device_name, reason);
+   if (strcmp(key, screen_key) == 0)
+      return;
+   snprintf(screen_key, sizeof(screen_key), "%s", key);
+
+   /* Background: color bars over a luminance ramp. */
+   for (y = 0; y < SCREEN_HEIGHT; y++)
+   {
+      uint32_t *row = &screen_buffer[y * SCREEN_WIDTH];
+      for (x = 0; x < SCREEN_WIDTH; x++)
+      {
+         uint32_t v = (uint32_t)((x * 255) / (SCREEN_WIDTH - 1));
+         row[x] = y < bars_height ? bar_colors[(x * 7) / SCREEN_WIDTH] : (v << 16) | (v << 8) | v;
+      }
+   }
+
+   /* Detail lines, wrapped to the panel width (8 px characters). */
+   if (opt_details)
+   {
+      line_count  = wrap_text(reason, (unsigned)(panel_w - 32) / FONT_GLYPH_SIZE, lines, 6);
+      lines[line_count++][0] = '\0'; /* Blank line */
+      line_count += wrap_text(hint, (unsigned)(panel_w - 32) / FONT_GLYPH_SIZE, lines + line_count, 5);
+   }
+   else
+   {
+      snprintf(lines[0], sizeof(lines[0]), "Set No Signal Details to On in Core Options for help.");
+      line_count = 1;
+   }
+
+   /* Panel: title (32 px), device name (16 px), then the detail lines (12 px each). */
+   panel_h = 24 + 32 + 16 + (active_device_name[0] ? 24 : 0) + 8 + line_count * 12 + 16;
+   panel_y = (SCREEN_HEIGHT - panel_h) / 2;
+   font_fill_rect(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
+         panel_x, panel_y, panel_w, panel_h, 0x000000);
+
+   y = panel_y + 24;
+   draw_centered(title, y, 4, 0xFFFFFF);
+   y += 32 + 16;
+
+   if (active_device_name[0])
+   {
+      char name[40];
+      snprintf(name, sizeof(name), "%.36s%s", active_device_name, strlen(active_device_name) > 36 ? "..." : "");
+      draw_centered(name, y, 2, 0xC0C0C0);
+      y += 24;
+   }
+
+   y += 8;
+   for (i = 0; i < line_count; i++, y += 12)
+      font_draw_text(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
+            panel_x + 16, y, lines[i], 1, 0xA0A0A0);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Output                                                                    */
+/* ------------------------------------------------------------------------ */
+
+/* Picks the color matrix for the current frame. */
+static enum color_matrix frame_matrix(const capture_frame_t *frame)
+{
+   switch (opt_color_space)
+   {
+      case COLOR_SPACE_REC709: return COLOR_MATRIX_REC709;
+      case COLOR_SPACE_REC601: return COLOR_MATRIX_REC601;
+      default: return frame->height <= 576 ? COLOR_MATRIX_REC601 : COLOR_MATRIX_REC709;
+   }
+}
+
+/* Applies crop, resolution, aspect ratio and color conversion to the last
+ * captured frame, then sends it to the frontend. */
 static void output_capture_frame(void)
 {
-   const capture_frame_t *frame = &capture_frame;
+   capture_frame_t *frame = &last_frame;
    unsigned crop_x     = 0;
    unsigned crop_width = frame->width;
    unsigned dst_width, dst_height;
-   const uint32_t *out;
+   uint32_t *out;
    size_t pitch;
    float aspect;
 
    /* Crop the central 4:3 area when the source is wider than 4:3. */
-   if (aspect_option == ASPECT_4_3_CROP && frame->width * 3 > frame->height * 4)
+   if (opt_aspect == ASPECT_4_3_CROP && frame->width * 3 > frame->height * 4)
    {
       crop_width = (frame->height * 4 + 1) / 3;
-      crop_x     = (frame->width - crop_width) / 2;
+      crop_x     = ((frame->width - crop_width) / 2) & ~1u; /* Even: YUV pixels come in pairs */
    }
 
-   switch (aspect_option)
+   switch (opt_aspect)
    {
       case ASPECT_4_3_SQUASH:
       case ASPECT_4_3_CROP: aspect = 4.0f / 3.0f; break;
@@ -483,63 +857,128 @@ static void output_capture_frame(void)
       default:              aspect = (float)crop_width / (float)frame->height; break;
    }
 
-   if (resolution_option == RESOLUTION_NATIVE)
+   if (opt_resolution == RESOLUTION_NATIVE)
    {
-      /* No copy: point into the captured frame. The pitch skips the cropped
-       * columns, so the frontend reads only the central area. */
       dst_width  = crop_width;
       dst_height = frame->height;
-      out        = frame->pixels + crop_x;
-      pitch      = frame->width * sizeof(uint32_t);
    }
    else
    {
-      dst_width  = resolution_option == RESOLUTION_320X240 ? 320 : 640;
-      dst_height = resolution_option == RESOLUTION_320X240 ? 240 : 480;
-      out        = scaled_buffer;
-      pitch      = dst_width * sizeof(uint32_t);
+      dst_width  = opt_resolution == RESOLUTION_320X240 ? 320 : 640;
+      dst_height = opt_resolution == RESOLUTION_320X240 ? 240 : 480;
+   }
 
-      if (!scale_area(frame->pixels, frame->width, crop_x, 0, crop_width, frame->height,
-            scaled_buffer, dst_width, dst_height))
-         return; /* Cannot happen with CAPTURE_MAX_* sizes; keep the previous frame */
+   if (frame->format == CAPTURE_FORMAT_XRGB8888 && opt_resolution == RESOLUTION_NATIVE)
+   {
+      /* No copy: point into the captured frame. The pitch skips the cropped
+       * columns, so the frontend reads only the central area. */
+      out   = (uint32_t *)frame->data + crop_x;
+      pitch = frame->stride;
+   }
+   else
+   {
+      if (!reserve_rgb_buffer((size_t)dst_width * dst_height))
+         return;
+      out   = rgb_buffer;
+      pitch = dst_width * sizeof(uint32_t);
+
+      if (frame->format == CAPTURE_FORMAT_XRGB8888)
+      {
+         if (!scale_area((const uint32_t *)frame->data, (unsigned)(frame->stride / 4), crop_x, 0,
+               crop_width, frame->height, out, dst_width, dst_height))
+            return; /* Cannot happen with CAPTURE_MAX_* sizes; keep the previous frame */
+      }
+      else
+      {
+         convert_set_colorimetry(frame_matrix(frame), opt_color_range);
+         if (!convert_yuv_frame(frame, crop_x, crop_width, out, dst_width, dst_height))
+            return;
+      }
    }
 
    set_output_geometry(dst_width, dst_height, aspect);
+
+   if (opt_stats == STATS_IMAGE)
+      draw_stats_overlay(out, pitch, dst_width, dst_height);
+
    last_output       = out;
    last_output_pitch = pitch;
    video_cb(out, dst_width, dst_height, pitch);
 }
 
-static void present_frame(void)
+static void output_no_signal_screen(enum signal_state state)
 {
-   if (capture_is_running() && capture_acquire_frame(&capture_frame))
+   render_no_signal_screen(state);
+   set_output_geometry(SCREEN_WIDTH, SCREEN_HEIGHT, 4.0f / 3.0f);
+   last_output       = screen_buffer;
+   last_output_pitch = SCREEN_WIDTH * sizeof(uint32_t);
+   video_cb(screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT, last_output_pitch);
+}
+
+/* Fetches the latest frame and works out whether there is a usable picture. */
+static enum signal_state poll_capture(bool *new_frame)
+{
+   const double frame_time = 1.0 / output_fps;
+   capture_frame_t frame;
+
+   *new_frame = false;
+
+   if (!active_device_id[0])
+      return SIGNAL_NO_DEVICE;
+
+   if (!capture_is_running())
    {
-      showing_capture        = true;
-      frames_without_capture = 0;
-      update_frame_rate(capture_frame.frame_rate);
+      /* Opening failed or the stream stopped: retry periodically, for example
+       * once another application releases the device. */
+      retry_timer -= frame_time;
+      if (retry_timer <= 0.0)
+         apply_device_selection(true);
+      return capture_is_running() ? SIGNAL_NO_FRAMES : SIGNAL_DEVICE_ERROR;
+   }
+
+   if (capture_acquire_frame(&frame))
+   {
+      last_frame            = frame;
+      have_frame            = true;
+      seconds_without_frame = 0.0;
+      seconds_black         = convert_frame_is_black(&frame) ? seconds_black + frame_time : 0.0;
+      stats_frames_shown++;
+      *new_frame = true;
+      update_frame_rate(frame.frame_rate);
+   }
+   else
+      seconds_without_frame += frame_time;
+
+   if (!have_frame || seconds_without_frame >= NO_FRAMES_TIMEOUT)
+      return SIGNAL_NO_FRAMES;
+   if (seconds_black >= BLACK_TIMEOUT)
+      return SIGNAL_BLACK;
+   return SIGNAL_OK;
+}
+
+static void present_frame(bool options_changed)
+{
+   bool new_frame;
+   const enum signal_state state = poll_capture(&new_frame);
+
+   if (state != SIGNAL_OK)
+   {
+      output_no_signal_screen(state);
+      return;
+   }
+
+   screen_key[0] = '\0'; /* Redraw the No Signal screen next time it appears */
+
+   if (opt_stats != STATS_OFF)
+      update_stats();
+
+   /* Show the new settings right away, even without a new frame. */
+   if (new_frame || options_changed || last_output == screen_buffer)
       output_capture_frame();
-      return;
-   }
-
-   if (showing_capture && ++frames_without_capture < SIGNAL_TIMEOUT_FRAMES)
-   {
-      /* The device runs at its own pace: repeat the previous frame. */
-      if (can_dupe)
-         video_cb(NULL, output_width, output_height, output_width * sizeof(uint32_t));
-      else
-         video_cb(last_output, output_width, output_height, last_output_pitch);
-      return;
-   }
-
-   if (showing_capture && log_cb)
-      log_cb(RETRO_LOG_WARN, LOG_PREFIX "No frames received, showing the test pattern.\n");
-   showing_capture = false;
-
-   update_test_pattern();
-   set_output_geometry(PATTERN_WIDTH, PATTERN_HEIGHT, 4.0f / 3.0f);
-   last_output       = pattern_buffer;
-   last_output_pitch = PATTERN_WIDTH * sizeof(uint32_t);
-   video_cb(pattern_buffer, PATTERN_WIDTH, PATTERN_HEIGHT, PATTERN_WIDTH * sizeof(uint32_t));
+   else if (can_dupe)
+      video_cb(NULL, output_width, output_height, last_output_pitch);
+   else
+      video_cb(last_output, output_width, output_height, last_output_pitch);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -565,7 +1004,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
    capture_set_logger(capture_logger);
 
-   /* The core is started with "Start Core"; no content file is needed. */
+   /* The core starts without content ("Start Core") or with a .vidcap file. */
    environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);
 
    refresh_device_list();
@@ -580,14 +1019,16 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb)               { inp
 
 RETRO_API void retro_init(void)
 {
-   frame_count = 0;
    memset(silence, 0, sizeof(silence));
-   init_test_pattern();
+   screen_key[0] = '\0';
 }
 
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
+   free(rgb_buffer);
+   rgb_buffer      = NULL;
+   rgb_buffer_size = 0;
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info)
@@ -595,8 +1036,8 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    memset(info, 0, sizeof(*info));
    info->library_name     = CORE_NAME;
    info->library_version  = CORE_VERSION;
-   info->valid_extensions = "";
-   info->need_fullpath    = false;
+   info->valid_extensions = "vidcap";
+   info->need_fullpath    = true; /* The file's content is not used */
    info->block_extract    = false;
 }
 
@@ -620,7 +1061,6 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 
 RETRO_API void retro_reset(void)
 {
-   frame_count = 0;
    apply_device_selection(true);
 }
 
@@ -633,17 +1073,12 @@ RETRO_API void retro_run(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
-      read_image_options();
+      read_options();
       apply_device_selection(false);
-
-      /* Show the new settings right away, even before the next frame. */
-      if (showing_capture)
-         output_capture_frame();
-      else
-         present_frame();
+      screen_key[0] = '\0';
    }
-   else
-      present_frame();
+
+   present_frame(updated);
 
    /* Silent audio matching the frame rate (800.8 frames per video frame at 59.94 fps). */
    if (audio_batch_cb)
@@ -660,14 +1095,11 @@ RETRO_API void retro_run(void)
 
       audio_batch_cb(silence, frames);
    }
-
-   frame_count++;
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
-   (void)game;
 
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
    {
@@ -677,11 +1109,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
    if (!environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &can_dupe))
       can_dupe = false;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_PERF_INTERFACE, &perf_cb))
+      memset(&perf_cb, 0, sizeof(perf_cb));
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &message_interface_version))
+      message_interface_version = 0;
 
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Core started (version %s).\n", CORE_VERSION);
+   if (game && game->path)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Content: %s\n", game->path);
 
+   read_options();
    active_device_id[0] = '\0';
-   read_image_options();
    apply_device_selection(true);
 
    /* retro_get_system_av_info() is called after this: report the device rate directly. */
@@ -701,7 +1139,7 @@ RETRO_API void retro_unload_game(void)
 {
    capture_stop();
    active_device_id[0] = '\0';
-   showing_capture     = false;
+   have_frame          = false;
 }
 
 RETRO_API unsigned retro_get_region(void)

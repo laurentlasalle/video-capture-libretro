@@ -40,13 +40,27 @@ enum capture_log_level
 
 typedef void (*capture_log_t)(enum capture_log_level level, const char *message);
 
+/* Pixel layout of a captured frame. */
+enum capture_format
+{
+   /* 32-bit pixels, 0xXXRRGGBB. Already RGB: converted by the backend or the device. */
+   CAPTURE_FORMAT_XRGB8888 = 0,
+   /* Planar 4:2:0: a full-size Y plane, then a half-size plane of interleaved
+    * U and V bytes. Both planes use the same stride. */
+   CAPTURE_FORMAT_NV12,
+   /* Packed 4:2:2: Y0 U Y1 V for each pair of pixels. */
+   CAPTURE_FORMAT_YUY2
+};
+
 /* A captured frame handed over to the core. */
 typedef struct capture_frame
 {
-   const uint32_t *pixels;     /* XRGB8888, tightly packed (pitch = width) */
-   unsigned        width;
-   unsigned        height;
-   double          frame_rate; /* Frames per second, or 0 if unknown */
+   uint8_t            *data;       /* First row of the image (the Y plane for NV12) */
+   size_t              stride;     /* Row length in bytes */
+   enum capture_format format;
+   unsigned            width;
+   unsigned            height;
+   double              frame_rate; /* Frames per second, or 0 if unknown */
 } capture_frame_t;
 
 /* Sets the function used by the backend to report messages. */
@@ -56,8 +70,10 @@ void capture_set_logger(capture_log_t logger);
 int capture_list_devices(capture_device_t *out, int max);
 
 /* Opens the device with the given id and starts streaming.
- * Returns false if the device could not be opened. */
-bool capture_start(const char *id);
+ * With `raw_yuv`, NV12 and YUY2 frames are delivered as is, for the core to
+ * convert; otherwise the backend delivers XRGB8888.
+ * Returns false if the device could not be opened; see capture_last_error(). */
+bool capture_start(const char *id, bool raw_yuv);
 
 /* Stops streaming and releases the device. Safe to call when not started. */
 void capture_stop(void);
@@ -65,9 +81,17 @@ void capture_stop(void);
 /* True while the device is open and has not reported an error. */
 bool capture_is_running(void);
 
+/* Human-readable reason for the last failure (opening or streaming), with a
+ * troubleshooting hint when one is known. Empty if there was no failure. */
+const char *capture_last_error(void);
+
 /* Frame rate of the current stream in frames per second, or 0 if unknown.
  * Known as soon as capture_start() succeeds, before the first frame. */
 double capture_get_frame_rate(void);
+
+/* Number of frames received from the device since capture_start(),
+ * including frames the core never picked up. Used for statistics. */
+uint64_t capture_frames_received(void);
 
 /* Hands over the most recent frame if one arrived since the previous call.
  * Returns false when there is no new frame.
@@ -75,7 +99,8 @@ double capture_get_frame_rate(void);
  * No copy is made: the backend keeps three buffers (one being written by the
  * device, one holding the latest complete frame, one owned by the core) and
  * swaps pointers. Older frames are dropped, never queued, so latency stays
- * minimal. `frame->pixels` stays valid until the next call to this function. */
+ * minimal. `frame->data` stays valid until the next call to this function,
+ * and the core may draw on it (for the stats overlay). */
 bool capture_acquire_frame(capture_frame_t *frame);
 
 #ifdef __cplusplus

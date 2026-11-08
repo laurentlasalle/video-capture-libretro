@@ -1,9 +1,11 @@
 /*
  * Media Foundation capture backend (Windows).
  *
- * Opens a video capture device through an asynchronous IMFSourceReader.
- * The device's native format is chosen explicitly, then the source reader's
- * video processor converts it to RGB32, which matches libretro's XRGB8888.
+ * Opens a video capture device through an asynchronous IMFSourceReader and
+ * picks one of its native formats explicitly. Frames are then delivered either
+ * as is (NV12 or YUY2, converted to RGB by the core after downscaling) or
+ * converted to RGB32 by the source reader's video processor.
+ *
  * Each received frame is copied once, into a triple buffer; the core picks up
  * the most recent one in retro_run() by swapping pointers.
  *
@@ -24,10 +26,13 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -53,6 +58,23 @@ static void log_message(enum capture_log_level level, const char *fmt, ...)
    vsnprintf(buffer, sizeof(buffer), fmt, va);
    va_end(va);
    g_logger(level, buffer);
+}
+
+/* Last failure, shown on the No Signal screen (guarded by g_error_mutex). */
+static std::mutex  g_error_mutex;
+static std::string g_last_error;
+
+static void set_last_error(const char *fmt, ...)
+{
+   char buffer[512];
+   va_list va;
+
+   va_start(va, fmt);
+   vsnprintf(buffer, sizeof(buffer), fmt, va);
+   va_end(va);
+
+   std::lock_guard<std::mutex> lock(g_error_mutex);
+   g_last_error = buffer;
 }
 
 template <class T>
@@ -100,31 +122,60 @@ static void copy_string(char *dst, size_t dst_size, const std::string &src)
    dst[len] = '\0';
 }
 
-static const char *subtype_name(const GUID &subtype, char *fourcc_buf)
+static std::string subtype_name(const GUID &subtype)
 {
-   if (subtype == MFVideoFormat_NV12)  return "NV12";
-   if (subtype == MFVideoFormat_YUY2)  return "YUY2";
-   if (subtype == MFVideoFormat_UYVY)  return "UYVY";
-   if (subtype == MFVideoFormat_RGB32) return "RGB32";
+   if (subtype == MFVideoFormat_NV12)   return "NV12";
+   if (subtype == MFVideoFormat_YUY2)   return "YUY2";
+   if (subtype == MFVideoFormat_UYVY)   return "UYVY";
+   if (subtype == MFVideoFormat_RGB32)  return "RGB32";
    if (subtype == MFVideoFormat_ARGB32) return "ARGB32";
-   if (subtype == MFVideoFormat_RGB24) return "RGB24";
-   if (subtype == MFVideoFormat_MJPG)  return "MJPG";
-   if (subtype == MFVideoFormat_P010)  return "P010";
+   if (subtype == MFVideoFormat_RGB24)  return "RGB24";
+   if (subtype == MFVideoFormat_MJPG)   return "MJPG";
+   if (subtype == MFVideoFormat_P010)   return "P010";
 
    /* Video subtypes are FourCC-based: the code is stored in Data1. */
-   fourcc_buf[0] = (char)(subtype.Data1 & 0xFF);
-   fourcc_buf[1] = (char)((subtype.Data1 >> 8) & 0xFF);
-   fourcc_buf[2] = (char)((subtype.Data1 >> 16) & 0xFF);
-   fourcc_buf[3] = (char)((subtype.Data1 >> 24) & 0xFF);
-   fourcc_buf[4] = '\0';
-   return fourcc_buf;
+   char fourcc[5];
+   fourcc[0] = (char)(subtype.Data1 & 0xFF);
+   fourcc[1] = (char)((subtype.Data1 >> 8) & 0xFF);
+   fourcc[2] = (char)((subtype.Data1 >> 16) & 0xFF);
+   fourcc[3] = (char)((subtype.Data1 >> 24) & 0xFF);
+   fourcc[4] = '\0';
+   return fourcc;
 }
 
-static bool is_uncompressed(const GUID &subtype)
+/* Formats the core can convert itself. */
+static bool is_raw_yuv(const GUID &subtype)
 {
-   return subtype == MFVideoFormat_NV12 || subtype == MFVideoFormat_YUY2 ||
-          subtype == MFVideoFormat_UYVY || subtype == MFVideoFormat_RGB32 ||
-          subtype == MFVideoFormat_ARGB32 || subtype == MFVideoFormat_RGB24;
+   return subtype == MFVideoFormat_NV12 || subtype == MFVideoFormat_YUY2;
+}
+
+/* Explains common HRESULTs from opening or streaming a device. */
+static void describe_device_error(const char *action, HRESULT hr)
+{
+   bool in_use = hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
+#ifdef MF_E_VIDEO_RECORDING_DEVICE_LOCKED
+   in_use = in_use || hr == MF_E_VIDEO_RECORDING_DEVICE_LOCKED;
+#endif
+#ifdef MF_E_HW_MFT_FAILED_START_STREAMING
+   in_use = in_use || hr == MF_E_HW_MFT_FAILED_START_STREAMING;
+#endif
+#ifdef MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+   in_use = in_use || hr == MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED;
+#endif
+
+   if (hr == E_ACCESSDENIED)
+      set_last_error("Windows denied access to the device. Check Settings > Privacy & security > "
+            "Camera > Let desktop apps access your camera.");
+   else if (in_use)
+      set_last_error("The device is in use by another application, such as OBS. "
+            "Close it or deactivate its source there.");
+   else if (hr == MF_E_SHUTDOWN || hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) ||
+            hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+      set_last_error("The device was disconnected.");
+   else
+      set_last_error("%s failed (error 0x%08lX).", action, (unsigned long)hr);
+
+   log_message(CAPTURE_LOG_ERROR, "%s failed (0x%08lX).", action, (unsigned long)hr);
 }
 
 /* COM and Media Foundation must be initialized on the calling thread.
@@ -180,12 +231,17 @@ struct mf_scope
  * A finished write slot is swapped with the ready slot; the core swaps the
  * ready slot with its read slot. A frame the core never picked up is simply
  * overwritten, so there is no queue and no added latency.
+ *
+ * Slots store images tightly packed (stride = width * bytes per pixel), with
+ * the NV12 chroma plane directly after the luma plane.
  */
 struct frame_slot
 {
-   std::vector<uint32_t> pixels;
-   unsigned width  = 0;
-   unsigned height = 0;
+   std::vector<uint8_t> data;
+   size_t               stride = 0;
+   enum capture_format  format = CAPTURE_FORMAT_XRGB8888;
+   unsigned             width  = 0;
+   unsigned             height = 0;
 };
 
 static frame_slot  g_slots[3];
@@ -197,33 +253,50 @@ static std::mutex  g_slot_mutex; /* Guards the slot pointers and g_ready_is_new 
 
 /* Current output format of the source reader. Written by update_output_format()
  * and read by the callback thread; guarded by g_format_mutex. */
-static std::mutex g_format_mutex;
-static UINT32     g_out_width;
-static UINT32     g_out_height;
-static LONG       g_out_stride;
-static double     g_out_frame_rate;
-static bool       g_warned_oversize;
+static std::mutex          g_format_mutex;
+static enum capture_format g_out_format;
+static UINT32              g_out_width;
+static UINT32              g_out_height;
+static LONG                g_out_stride; /* Default stride in bytes, negative if bottom-up */
+static double              g_out_frame_rate;
+static bool                g_warned_oversize;
 
-static std::atomic<bool> g_running(false);
+static std::atomic<bool>     g_running(false);
+static std::atomic<uint64_t> g_frames_received(0);
 
 static void update_output_format(IMFSourceReader *reader)
 {
    IMFMediaType *type = nullptr;
+   GUID subtype = GUID_NULL;
    UINT32 width = 0, height = 0, rate_num = 0, rate_den = 0;
+   enum capture_format format;
    LONG stride;
    double frame_rate;
 
    if (FAILED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &type)))
       return;
 
+   type->GetGUID(MF_MT_SUBTYPE, &subtype);
    MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
    MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &rate_num, &rate_den);
-   stride     = (LONG)MFGetAttributeUINT32(type, MF_MT_DEFAULT_STRIDE, width * 4);
+
+   if (subtype == MFVideoFormat_NV12)
+      format = CAPTURE_FORMAT_NV12;
+   else if (subtype == MFVideoFormat_YUY2)
+      format = CAPTURE_FORMAT_YUY2;
+   else
+      format = CAPTURE_FORMAT_XRGB8888;
+
+   {
+      const UINT32 bytes_per_pixel = format == CAPTURE_FORMAT_XRGB8888 ? 4 : (format == CAPTURE_FORMAT_YUY2 ? 2 : 1);
+      stride = (LONG)MFGetAttributeUINT32(type, MF_MT_DEFAULT_STRIDE, width * bytes_per_pixel);
+   }
    frame_rate = rate_den ? (double)rate_num / rate_den : 0.0;
    safe_release(&type);
 
    {
       std::lock_guard<std::mutex> lock(g_format_mutex);
+      g_out_format      = format;
       g_out_width       = width;
       g_out_height      = height;
       g_out_stride      = stride;
@@ -231,26 +304,58 @@ static void update_output_format(IMFSourceReader *reader)
       g_warned_oversize = false;
    }
 
-   log_message(CAPTURE_LOG_INFO, "Output format: %ux%u RGB32 @ %.3f fps (%u/%u), stride %ld.",
-         (unsigned)width, (unsigned)height, frame_rate, (unsigned)rate_num, (unsigned)rate_den,
-         (long)stride);
+   log_message(CAPTURE_LOG_INFO, "Output format: %ux%u %s @ %.3f fps (%u/%u), stride %ld.",
+         (unsigned)width, (unsigned)height, subtype_name(subtype).c_str(), frame_rate,
+         (unsigned)rate_num, (unsigned)rate_den, (long)stride);
 }
 
-/* Copies a locked image into the write slot. `pitch` is in bytes and may be
- * negative for bottom-up images; scan0 always points to the top row. */
-static void copy_to_write_slot(const BYTE *scan0, LONG pitch, unsigned width, unsigned height)
+/* Copies `rows` rows of `row_bytes` bytes. `pitch` may be negative for
+ * bottom-up images; src always points to the top row. */
+static void copy_plane(uint8_t *dst, const BYTE *src, LONG pitch, size_t row_bytes, unsigned rows)
+{
+   if (pitch == (LONG)row_bytes)
+      memcpy(dst, src, row_bytes * rows);
+   else
+      for (unsigned y = 0; y < rows; y++)
+         memcpy(dst + y * row_bytes, src + (ptrdiff_t)y * pitch, row_bytes);
+}
+
+/* Copies a locked image into the write slot, then publishes it.
+ * `buffer_len` is the size of the locked buffer, used to find the NV12 chroma
+ * plane when the driver pads the luma plane. */
+static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
+      enum capture_format format, unsigned width, unsigned height)
 {
    frame_slot *slot = g_write_slot; /* Only this thread touches the write slot */
+   const size_t bytes_per_pixel = format == CAPTURE_FORMAT_XRGB8888 ? 4 : (format == CAPTURE_FORMAT_YUY2 ? 2 : 1);
+   const size_t row_bytes = (size_t)width * bytes_per_pixel;
+   const size_t luma_size = row_bytes * height;
 
-   slot->pixels.resize((size_t)width * height); /* Allocates only when the size grows */
+   if (format == CAPTURE_FORMAT_NV12)
+   {
+      const size_t abs_pitch = (size_t)(pitch < 0 ? -pitch : pitch);
+      const unsigned chroma_rows = (height + 1) / 2;
+      size_t chroma_offset = abs_pitch * height;
+
+      /* Some drivers pad the luma plane to a multiple of 16 rows. The buffer
+       * then holds 1.5 padded planes: the chroma plane starts at 2/3. */
+      if (pitch > 0 && buffer_len > abs_pitch * (height + chroma_rows))
+         chroma_offset = (buffer_len / (3 * abs_pitch)) * 2 * abs_pitch;
+
+      slot->data.resize(luma_size + row_bytes * chroma_rows); /* Allocates only when the size grows */
+      copy_plane(slot->data.data(), scan0, pitch, row_bytes, height);
+      copy_plane(slot->data.data() + luma_size, scan0 + chroma_offset, pitch, row_bytes, chroma_rows);
+   }
+   else
+   {
+      slot->data.resize(luma_size);
+      copy_plane(slot->data.data(), scan0, pitch, row_bytes, height);
+   }
+
+   slot->stride = row_bytes;
+   slot->format = format;
    slot->width  = width;
    slot->height = height;
-
-   if (pitch == (LONG)(width * 4))
-      memcpy(slot->pixels.data(), scan0, (size_t)width * height * 4);
-   else
-      for (unsigned y = 0; y < height; y++)
-         memcpy(&slot->pixels[(size_t)y * width], scan0 + (ptrdiff_t)y * pitch, (size_t)width * 4);
 
    /* Publish: the finished frame becomes the ready one. */
    std::lock_guard<std::mutex> lock(g_slot_mutex);
@@ -262,11 +367,16 @@ static void store_sample(IMFSample *sample)
 {
    IMFMediaBuffer *buffer = nullptr;
    IMF2DBuffer *buffer2d  = nullptr;
+   enum capture_format format;
    unsigned width, height;
    LONG default_stride;
+   BYTE *data      = nullptr;
+   DWORD max_len   = 0;
+   DWORD cur_len   = 0;
 
    {
       std::lock_guard<std::mutex> lock(g_format_mutex);
+      format         = g_out_format;
       width          = g_out_width;
       height         = g_out_height;
       default_stride = g_out_stride;
@@ -284,38 +394,43 @@ static void store_sample(IMFSample *sample)
       }
    }
 
+   g_frames_received++;
+
    if (FAILED(sample->ConvertToContiguousBuffer(&buffer)))
       return;
 
-   /* Prefer IMF2DBuffer: it gives the real pitch and first-row pointer,
-    * including for bottom-up images (negative pitch). */
-   if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&buffer2d))))
    {
-      BYTE *scan0 = nullptr;
-      LONG pitch  = 0;
+      const size_t bytes_per_pixel = format == CAPTURE_FORMAT_XRGB8888 ? 4 : (format == CAPTURE_FORMAT_YUY2 ? 2 : 1);
+      const unsigned rows = format == CAPTURE_FORMAT_NV12 ? height + height / 2 : height;
 
-      if (SUCCEEDED(buffer2d->Lock2D(&scan0, &pitch)))
+      /* Prefer IMF2DBuffer: it gives the real pitch and first-row pointer,
+       * including for bottom-up images (negative pitch). Otherwise fall back
+       * to a plain lock and the media type's default stride. A buffer must
+       * not be locked both ways at once. */
+      if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(&buffer2d))))
       {
-         copy_to_write_slot(scan0, pitch, width, height);
-         buffer2d->Unlock2D();
-      }
-      safe_release(&buffer2d);
-   }
-   else
-   {
-      BYTE *data     = nullptr;
-      DWORD max_len  = 0;
-      DWORD cur_len  = 0;
-      LONG pitch     = default_stride ? default_stride : (LONG)(width * 4);
-      LONG abs_pitch = pitch < 0 ? -pitch : pitch;
+         BYTE *scan0 = nullptr;
+         LONG pitch  = 0;
+         DWORD len   = 0;
 
-      if (SUCCEEDED(buffer->Lock(&data, &max_len, &cur_len)))
-      {
-         if ((size_t)cur_len >= (size_t)abs_pitch * height && abs_pitch >= (LONG)(width * 4))
+         buffer2d->GetContiguousLength(&len);
+         if (SUCCEEDED(buffer2d->Lock2D(&scan0, &pitch)))
          {
-            const BYTE *scan0 = pitch < 0 ? data + (size_t)abs_pitch * (height - 1) : data;
-            copy_to_write_slot(scan0, pitch, width, height);
+            const size_t abs_pitch = (size_t)(pitch < 0 ? -pitch : pitch);
+            if (abs_pitch >= width * bytes_per_pixel)
+               copy_to_write_slot(scan0, pitch, len ? len : abs_pitch * rows, format, width, height);
+            buffer2d->Unlock2D();
          }
+         safe_release(&buffer2d);
+      }
+      else if (SUCCEEDED(buffer->Lock(&data, &max_len, &cur_len)))
+      {
+         const LONG pitch       = default_stride ? default_stride : (LONG)(width * bytes_per_pixel);
+         const size_t abs_pitch = (size_t)(pitch < 0 ? -pitch : pitch);
+         const BYTE *scan0      = pitch < 0 ? data + abs_pitch * (height - 1) : data;
+
+         if (abs_pitch >= width * bytes_per_pixel && (size_t)cur_len >= abs_pitch * rows)
+            copy_to_write_slot(scan0, pitch, cur_len, format, width, height);
          buffer->Unlock();
       }
    }
@@ -400,13 +515,14 @@ public:
 
       if (FAILED(status))
       {
-         log_message(CAPTURE_LOG_ERROR, "ReadSample failed (0x%08lX).", (unsigned long)status);
+         describe_device_error("Reading from the device", status);
          g_running = false;
          return S_OK;
       }
 
       if (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))
       {
+         set_last_error("The device stopped streaming. It may have been disconnected.");
          log_message(CAPTURE_LOG_ERROR, "Capture stream ended (flags 0x%08lX).", (unsigned long)flags);
          g_running = false;
          return S_OK;
@@ -433,7 +549,7 @@ public:
                0, nullptr, nullptr, nullptr, nullptr);
          if (FAILED(hr))
          {
-            log_message(CAPTURE_LOG_ERROR, "ReadSample request failed (0x%08lX).", (unsigned long)hr);
+            describe_device_error("Requesting a frame", hr);
             g_running = false;
          }
       }
@@ -472,24 +588,99 @@ static IMFMediaSource  *g_source   = nullptr;
 static IMFSourceReader *g_reader   = nullptr;
 static reader_callback *g_callback = nullptr;
 
+/* Ranks a subtype for the selected conversion mode (higher is better). */
+static int format_rank(const GUID &subtype, bool raw_yuv)
+{
+   if (raw_yuv)
+   {
+      /* NV12 is the smallest to copy (12 bits per pixel), then YUY2 (16). */
+      if (subtype == MFVideoFormat_NV12) return 3;
+      if (subtype == MFVideoFormat_YUY2) return 2;
+   }
+   else if (subtype == MFVideoFormat_RGB32)
+      return 3; /* Delivered as RGB by the device: no conversion at all */
+
+   if (subtype == MFVideoFormat_MJPG)
+      return 0; /* Needs a decoder */
+   return 1;
+}
+
+/* Logs the device's native formats grouped by type and size, with the list of
+ * frame rates, instead of one line per format (devices may list hundreds). */
+static void log_native_formats(IMFSourceReader *reader)
+{
+   struct group
+   {
+      std::string         label;
+      std::vector<double> rates;
+   };
+   std::vector<group> groups;
+
+   for (DWORD i = 0;; i++)
+   {
+      IMFMediaType *type = nullptr;
+      GUID subtype = GUID_NULL;
+      UINT32 width = 0, height = 0, num = 0, den = 0;
+      char label[64];
+
+      HRESULT hr = reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &type);
+      if (hr == MF_E_NO_MORE_TYPES)
+         break;
+      if (FAILED(hr))
+         continue;
+
+      type->GetGUID(MF_MT_SUBTYPE, &subtype);
+      MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
+      MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
+      safe_release(&type);
+
+      snprintf(label, sizeof(label), "%s %ux%u", subtype_name(subtype).c_str(), (unsigned)width, (unsigned)height);
+
+      auto it = std::find_if(groups.begin(), groups.end(), [&](const group &g) { return g.label == label; });
+      if (it == groups.end())
+      {
+         groups.push_back(group{ label, {} });
+         it = groups.end() - 1;
+      }
+
+      const double fps = den ? std::round((double)num / den * 100.0) / 100.0 : 0.0;
+      if (std::find(it->rates.begin(), it->rates.end(), fps) == it->rates.end())
+         it->rates.push_back(fps);
+   }
+
+   for (group &g : groups)
+   {
+      std::string line = "Native format: " + g.label + " @ ";
+      char rate[16];
+
+      std::sort(g.rates.begin(), g.rates.end(), std::greater<double>());
+      for (size_t i = 0; i < g.rates.size(); i++)
+      {
+         snprintf(rate, sizeof(rate), "%s%g", i ? ", " : "", g.rates[i]);
+         line += rate;
+      }
+      log_message(CAPTURE_LOG_DEBUG, "%s fps.", line.c_str());
+   }
+}
+
 /* Picks the device's native format to request. Preference order:
  * 1. at most 1920x1080 (4K is unnecessary for low-resolution shaders),
  * 2. highest frame rate,
  * 3. largest frame size,
- * 4. uncompressed formats over MJPG and others. */
-static IMFMediaType *select_native_type(IMFSourceReader *reader)
+ * 4. best format for the conversion mode (see format_rank()). */
+static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv)
 {
    IMFMediaType *best = nullptr;
-   bool best_fits = false, best_raw = false;
+   bool best_fits = false;
    unsigned best_fps = 0;
    UINT64 best_area = 0;
+   int best_rank = -1;
 
    for (DWORD i = 0;; i++)
    {
       IMFMediaType *type = nullptr;
       GUID subtype = GUID_NULL;
       UINT32 width = 0, height = 0, rate_num = 0, rate_den = 0;
-      char fourcc[5];
 
       HRESULT hr = reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &type);
       if (hr == MF_E_NO_MORE_TYPES)
@@ -501,22 +692,17 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader)
       MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
       MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &rate_num, &rate_den);
 
-      const double fps_exact = rate_den ? (double)rate_num / rate_den : 0.0;
-      const unsigned fps     = (unsigned)(fps_exact + 0.5);
-      const UINT64 area      = (UINT64)width * height;
-      const bool fits        = width <= 1920 && height <= 1080;
-      const bool raw         = is_uncompressed(subtype);
+      const unsigned fps = rate_den ? (unsigned)((double)rate_num / rate_den + 0.5) : 0;
+      const UINT64 area  = (UINT64)width * height;
+      const bool fits    = width <= 1920 && height <= 1080;
+      const int rank     = format_rank(subtype, raw_yuv);
 
-      log_message(CAPTURE_LOG_DEBUG, "Native format %lu: %ux%u @ %.3f fps, %s.",
-            (unsigned long)i, (unsigned)width, (unsigned)height, fps_exact,
-            subtype_name(subtype, fourcc));
-
-      bool better = false;
-      if (!best)                       better = true;
-      else if (fits != best_fits)      better = fits;
-      else if (fps != best_fps)        better = fps > best_fps;
-      else if (area != best_area)      better = area > best_area;
-      else if (raw != best_raw)        better = raw;
+      bool better;
+      if (!best)                  better = true;
+      else if (fits != best_fits) better = fits;
+      else if (fps != best_fps)   better = fps > best_fps;
+      else if (area != best_area) better = area > best_area;
+      else                        better = rank > best_rank;
 
       if (better)
       {
@@ -525,7 +711,7 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader)
          best_fits = fits;
          best_fps  = fps;
          best_area = area;
-         best_raw  = raw;
+         best_rank = rank;
       }
       else
          safe_release(&type);
@@ -636,19 +822,24 @@ extern "C" int capture_list_devices(capture_device_t *out, int max)
    return found;
 }
 
-extern "C" bool capture_start(const char *id)
+extern "C" bool capture_start(const char *id, bool raw_yuv)
 {
    IMFAttributes *source_attributes = nullptr;
    IMFAttributes *reader_attributes = nullptr;
    IMFMediaType *native_type        = nullptr;
-   IMFMediaType *output_type        = nullptr;
    std::wstring wide_id             = utf8_to_wide(id);
+   GUID native_subtype              = GUID_NULL;
    HRESULT hr;
 
    capture_stop();
+   set_last_error("%s", "");
+   g_frames_received = 0;
 
    if (wide_id.empty() || !g_session_scope.init())
+   {
+      set_last_error("Could not initialize Media Foundation.");
       return false;
+   }
 
    /* Create the media source for the device. */
    hr = MFCreateAttributes(&source_attributes, 2);
@@ -663,7 +854,7 @@ extern "C" bool capture_start(const char *id)
    safe_release(&source_attributes);
    if (FAILED(hr))
    {
-      log_message(CAPTURE_LOG_ERROR, "Could not open the capture device (0x%08lX).", (unsigned long)hr);
+      describe_device_error("Opening the device", hr);
       release_session();
       return false;
    }
@@ -683,7 +874,7 @@ extern "C" bool capture_start(const char *id)
    safe_release(&reader_attributes);
    if (FAILED(hr))
    {
-      log_message(CAPTURE_LOG_ERROR, "Could not create the source reader (0x%08lX).", (unsigned long)hr);
+      describe_device_error("Creating the source reader", hr);
       release_session();
       return false;
    }
@@ -692,25 +883,25 @@ extern "C" bool capture_start(const char *id)
    g_reader->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
 
    /* Pick and apply the device's native format. */
-   native_type = select_native_type(g_reader);
+   log_native_formats(g_reader);
+   native_type = select_native_type(g_reader, raw_yuv);
    if (!native_type)
    {
+      set_last_error("The device reports no usable video format.");
       log_message(CAPTURE_LOG_ERROR, "The device reports no usable video format.");
       release_session();
       return false;
    }
 
    {
-      GUID subtype = GUID_NULL;
       UINT32 width = 0, height = 0, num = 0, den = 0;
-      char fourcc[5];
 
-      native_type->GetGUID(MF_MT_SUBTYPE, &subtype);
+      native_type->GetGUID(MF_MT_SUBTYPE, &native_subtype);
       MFGetAttributeSize(native_type, MF_MT_FRAME_SIZE, &width, &height);
       MFGetAttributeRatio(native_type, MF_MT_FRAME_RATE, &num, &den);
       log_message(CAPTURE_LOG_INFO, "Selected native format: %ux%u @ %.3f fps, %s.",
             (unsigned)width, (unsigned)height, den ? (double)num / den : 0.0,
-            subtype_name(subtype, fourcc));
+            subtype_name(native_subtype).c_str());
    }
 
    hr = g_reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, native_type);
@@ -718,20 +909,25 @@ extern "C" bool capture_start(const char *id)
       log_message(CAPTURE_LOG_WARN, "Could not set the native format (0x%08lX), using the device default.",
             (unsigned long)hr);
 
-   /* Ask the source reader to convert to RGB32. */
-   output_type = make_rgb32_type(native_type);
-   hr = output_type
-      ? g_reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output_type)
-      : E_OUTOFMEMORY;
-   safe_release(&output_type);
-   safe_release(&native_type);
-   if (FAILED(hr))
+   /* NV12 and YUY2 are delivered as is when the core converts them; anything
+    * else is converted to RGB32 by the source reader. */
+   if (!(raw_yuv && SUCCEEDED(hr) && is_raw_yuv(native_subtype)))
    {
-      log_message(CAPTURE_LOG_ERROR, "Could not convert the device format to RGB32 (0x%08lX).",
-            (unsigned long)hr);
-      release_session();
-      return false;
+      IMFMediaType *output_type = make_rgb32_type(native_type);
+
+      hr = output_type
+         ? g_reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output_type)
+         : E_OUTOFMEMORY;
+      safe_release(&output_type);
+      if (FAILED(hr))
+      {
+         safe_release(&native_type);
+         describe_device_error("Converting the device format to RGB32", hr);
+         release_session();
+         return false;
+      }
    }
+   safe_release(&native_type);
 
    update_output_format(g_reader);
 
@@ -748,7 +944,7 @@ extern "C" bool capture_start(const char *id)
    hr = g_reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, nullptr, nullptr, nullptr);
    if (FAILED(hr))
    {
-      log_message(CAPTURE_LOG_ERROR, "Could not start streaming (0x%08lX).", (unsigned long)hr);
+      describe_device_error("Starting the stream", hr);
       release_session();
       return false;
    }
@@ -767,10 +963,25 @@ extern "C" bool capture_is_running(void)
    return g_running;
 }
 
+extern "C" const char *capture_last_error(void)
+{
+   /* Copied so the pointer stays valid after the lock is released. Only the
+    * core thread calls this, so one static copy is enough. */
+   static std::string copy;
+   std::lock_guard<std::mutex> lock(g_error_mutex);
+   copy = g_last_error;
+   return copy.c_str();
+}
+
 extern "C" double capture_get_frame_rate(void)
 {
    std::lock_guard<std::mutex> lock(g_format_mutex);
    return g_out_frame_rate;
+}
+
+extern "C" uint64_t capture_frames_received(void)
+{
+   return g_frames_received;
 }
 
 extern "C" bool capture_acquire_frame(capture_frame_t *frame)
@@ -783,7 +994,9 @@ extern "C" bool capture_acquire_frame(capture_frame_t *frame)
       g_ready_is_new = false;
    }
 
-   frame->pixels     = g_read_slot->pixels.data();
+   frame->data       = g_read_slot->data.data();
+   frame->stride     = g_read_slot->stride;
+   frame->format     = g_read_slot->format;
    frame->width      = g_read_slot->width;
    frame->height     = g_read_slot->height;
    frame->frame_rate = capture_get_frame_rate();

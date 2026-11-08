@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(video_capture_libretro VERSION 0.2.2 LANGUAGES C CXX)
+project(video_capture_libretro VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -16,7 +16,12 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-set(CORE_SOURCES src/video_capture_libretro.c src/scale.c)
+set(CORE_SOURCES
+  src/video_capture_libretro.c
+  src/convert.c
+  src/font.c
+  src/scale.c
+)
 
 if(WIN32)
   list(APPEND CORE_SOURCES src/capture_mf.cpp)
