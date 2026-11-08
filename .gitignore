@@ -1,0 +1,13 @@
+build/
+out/
+.vs/
+.vscode/
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
