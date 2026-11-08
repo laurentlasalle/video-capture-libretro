@@ -12,7 +12,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -66,8 +65,10 @@ static retro_input_poll_t         input_poll_cb;
 static retro_input_state_t        input_state_cb;
 static retro_log_printf_t         log_cb;
 
-/* Test pattern */
+/* Test pattern: the static image, and the copy shown with the sweeping line */
+static uint32_t pattern_base[PATTERN_WIDTH * PATTERN_HEIGHT];
 static uint32_t pattern_buffer[PATTERN_WIDTH * PATTERN_HEIGHT];
+static int      pattern_line_y = -1; /* Row where the sweeping line is drawn, -1 if none */
 static int16_t  silence[AUDIO_FRAMES_MAX * 2];
 static double   audio_frames_pending; /* Fractional audio frames carried between video frames */
 static uint64_t frame_count;
@@ -76,16 +77,13 @@ static uint64_t frame_count;
 static capture_device_t devices[CAPTURE_MAX_DEVICES];
 static int              device_count;
 static char             active_device_id[sizeof(devices[0].id)];
-static uint32_t        *capture_buffer;
-static unsigned         capture_width;
-static unsigned         capture_height;
-static uint64_t         capture_sequence;
+static capture_frame_t  capture_frame;          /* Last frame received from the device */
 static unsigned         frames_without_capture;
 static bool             showing_capture;
 static bool             can_dupe;
 
-/* Image processing */
-static uint32_t              *scaled_buffer;
+/* Image processing. Scaled output is at most 640x480. */
+static uint32_t               scaled_buffer[640 * 480];
 static enum output_resolution resolution_option = RESOLUTION_NATIVE;
 static enum aspect_mode       aspect_option     = ASPECT_SOURCE;
 
@@ -97,6 +95,7 @@ static double   output_fps    = DEFAULT_FPS;
 
 /* Last frame sent, repeated when the device has no new frame yet */
 static const uint32_t *last_output;
+static size_t          last_output_pitch; /* In bytes */
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
@@ -141,38 +140,55 @@ static const uint32_t bar_colors[7] = {
    0xBFBFBF, 0xBFBF00, 0x00BFBF, 0x00BF00, 0xBF00BF, 0xBF0000, 0x0000BF
 };
 
-/* Draws the color bars plus a white line that sweeps down the screen once
- * per second, so a frozen image or uneven pacing is easy to spot. */
-static void render_test_pattern(void)
+/* Draws the static part of the test pattern once: color bars over a
+ * black-to-white luminance ramp. */
+static void init_test_pattern(void)
 {
    const int bars_height = (PATTERN_HEIGHT * 2) / 3;
-   const uint64_t fps    = (uint64_t)(output_fps + 0.5);
-   const int sweep_y     = (int)((frame_count % fps) * PATTERN_HEIGHT / fps);
    int x, y;
 
    for (y = 0; y < PATTERN_HEIGHT; y++)
    {
-      uint32_t *row = &pattern_buffer[y * PATTERN_WIDTH];
+      uint32_t *row = &pattern_base[y * PATTERN_WIDTH];
 
       for (x = 0; x < PATTERN_WIDTH; x++)
       {
-         uint32_t color;
-
          if (y < bars_height)
-            color = bar_colors[(x * 7) / PATTERN_WIDTH];
+            row[x] = bar_colors[(x * 7) / PATTERN_WIDTH];
          else
          {
-            /* Bottom third: black-to-white luminance ramp. */
             uint32_t v = (uint32_t)((x * 255) / (PATTERN_WIDTH - 1));
-            color = (v << 16) | (v << 8) | v;
+            row[x] = (v << 16) | (v << 8) | v;
          }
-
-         if (y == sweep_y || y == sweep_y + 1)
-            color = 0xFFFFFF;
-
-         row[x] = color;
       }
    }
+
+   memcpy(pattern_buffer, pattern_base, sizeof(pattern_buffer));
+   pattern_line_y = -1;
+}
+
+/* Moves the white line that sweeps down the screen once per second, so a
+ * frozen image or uneven pacing is easy to spot. Only the two rows the line
+ * leaves and the two rows it enters are rewritten. */
+static void update_test_pattern(void)
+{
+   const uint64_t fps = (uint64_t)(output_fps + 0.5);
+   const int line_y   = (int)((frame_count % fps) * (PATTERN_HEIGHT - 1) / fps);
+   const size_t two_rows = 2 * PATTERN_WIDTH * sizeof(uint32_t);
+   int x;
+
+   if (line_y == pattern_line_y)
+      return;
+
+   /* Restore the rows under the previous line. */
+   if (pattern_line_y >= 0)
+      memcpy(&pattern_buffer[pattern_line_y * PATTERN_WIDTH],
+            &pattern_base[pattern_line_y * PATTERN_WIDTH], two_rows);
+
+   for (x = 0; x < 2 * PATTERN_WIDTH; x++)
+      pattern_buffer[line_y * PATTERN_WIDTH + x] = 0xFFFFFF;
+
+   pattern_line_y = line_y;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -408,19 +424,18 @@ static void set_output_geometry(unsigned width, unsigned height, float aspect)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Output: %ux%u, aspect ratio %.4f.\n", width, height, aspect);
 }
 
-/* Returns the device frame rate, or the current one if unknown or implausible. */
-static double device_fps(void)
+/* Returns `fps` if plausible, otherwise the current output rate. */
+static double valid_fps(double fps)
 {
-   double fps = capture_get_frame_rate();
    return (fps >= 10.0 && fps <= 240.0) ? fps : output_fps;
 }
 
 /* Reports the device frame rate to the frontend when it changes, so RetroArch
  * paces retro_run() on the capture device instead of a fixed 60 Hz. */
-static void update_frame_rate(void)
+static void update_frame_rate(double device_rate)
 {
    struct retro_system_av_info av_info;
-   double fps = device_fps();
+   double fps = valid_fps(device_rate);
 
    if (fps == output_fps)
       return;
@@ -445,25 +460,19 @@ static void update_frame_rate(void)
  * then sends it to the frontend. */
 static void output_capture_frame(void)
 {
-   unsigned crop_x      = 0;
-   unsigned crop_width  = capture_width;
-   unsigned dst_width   = capture_width;
-   unsigned dst_height  = capture_height;
-   float aspect;
+   const capture_frame_t *frame = &capture_frame;
+   unsigned crop_x     = 0;
+   unsigned crop_width = frame->width;
+   unsigned dst_width, dst_height;
    const uint32_t *out;
+   size_t pitch;
+   float aspect;
 
    /* Crop the central 4:3 area when the source is wider than 4:3. */
-   if (aspect_option == ASPECT_4_3_CROP && capture_width * 3 > capture_height * 4)
+   if (aspect_option == ASPECT_4_3_CROP && frame->width * 3 > frame->height * 4)
    {
-      crop_width = (capture_height * 4 + 1) / 3;
-      crop_x     = (capture_width - crop_width) / 2;
-   }
-
-   switch (resolution_option)
-   {
-      case RESOLUTION_640X480: dst_width = 640; dst_height = 480; break;
-      case RESOLUTION_320X240: dst_width = 320; dst_height = 240; break;
-      default:                 dst_width = crop_width; dst_height = capture_height; break;
+      crop_width = (frame->height * 4 + 1) / 3;
+      crop_x     = (frame->width - crop_width) / 2;
    }
 
    switch (aspect_option)
@@ -471,35 +480,43 @@ static void output_capture_frame(void)
       case ASPECT_4_3_SQUASH:
       case ASPECT_4_3_CROP: aspect = 4.0f / 3.0f; break;
       case ASPECT_16_9:     aspect = 16.0f / 9.0f; break;
-      default:              aspect = (float)crop_width / (float)capture_height; break;
+      default:              aspect = (float)crop_width / (float)frame->height; break;
    }
 
-   if (crop_x == 0 && dst_width == capture_width && dst_height == capture_height)
-      out = capture_buffer;
+   if (resolution_option == RESOLUTION_NATIVE)
+   {
+      /* No copy: point into the captured frame. The pitch skips the cropped
+       * columns, so the frontend reads only the central area. */
+      dst_width  = crop_width;
+      dst_height = frame->height;
+      out        = frame->pixels + crop_x;
+      pitch      = frame->width * sizeof(uint32_t);
+   }
    else
    {
-      scale_area(capture_buffer, capture_width, crop_x, 0, crop_width, capture_height,
-            scaled_buffer, dst_width, dst_height);
-      out = scaled_buffer;
+      dst_width  = resolution_option == RESOLUTION_320X240 ? 320 : 640;
+      dst_height = resolution_option == RESOLUTION_320X240 ? 240 : 480;
+      out        = scaled_buffer;
+      pitch      = dst_width * sizeof(uint32_t);
+
+      if (!scale_area(frame->pixels, frame->width, crop_x, 0, crop_width, frame->height,
+            scaled_buffer, dst_width, dst_height))
+         return; /* Cannot happen with CAPTURE_MAX_* sizes; keep the previous frame */
    }
 
    set_output_geometry(dst_width, dst_height, aspect);
-   last_output = out;
-   video_cb(out, dst_width, dst_height, dst_width * sizeof(uint32_t));
+   last_output       = out;
+   last_output_pitch = pitch;
+   video_cb(out, dst_width, dst_height, pitch);
 }
 
 static void present_frame(void)
 {
-   bool new_frame = false;
-
-   if (capture_buffer && capture_is_running())
-      new_frame = capture_fetch_frame(capture_buffer, &capture_width, &capture_height, &capture_sequence);
-
-   if (new_frame)
+   if (capture_is_running() && capture_acquire_frame(&capture_frame))
    {
       showing_capture        = true;
       frames_without_capture = 0;
-      update_frame_rate();
+      update_frame_rate(capture_frame.frame_rate);
       output_capture_frame();
       return;
    }
@@ -510,7 +527,7 @@ static void present_frame(void)
       if (can_dupe)
          video_cb(NULL, output_width, output_height, output_width * sizeof(uint32_t));
       else
-         video_cb(last_output, output_width, output_height, output_width * sizeof(uint32_t));
+         video_cb(last_output, output_width, output_height, last_output_pitch);
       return;
    }
 
@@ -518,9 +535,10 @@ static void present_frame(void)
       log_cb(RETRO_LOG_WARN, LOG_PREFIX "No frames received, showing the test pattern.\n");
    showing_capture = false;
 
-   render_test_pattern();
+   update_test_pattern();
    set_output_geometry(PATTERN_WIDTH, PATTERN_HEIGHT, 4.0f / 3.0f);
-   last_output = pattern_buffer;
+   last_output       = pattern_buffer;
+   last_output_pitch = PATTERN_WIDTH * sizeof(uint32_t);
    video_cb(pattern_buffer, PATTERN_WIDTH, PATTERN_HEIGHT, PATTERN_WIDTH * sizeof(uint32_t));
 }
 
@@ -564,15 +582,12 @@ RETRO_API void retro_init(void)
 {
    frame_count = 0;
    memset(silence, 0, sizeof(silence));
+   init_test_pattern();
 }
 
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
-   free(capture_buffer);
-   free(scaled_buffer);
-   capture_buffer = NULL;
-   scaled_buffer  = NULL;
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info)
@@ -663,25 +678,14 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    if (!environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &can_dupe))
       can_dupe = false;
 
-   if (!capture_buffer)
-      capture_buffer = (uint32_t *)malloc((size_t)CAPTURE_MAX_WIDTH * CAPTURE_MAX_HEIGHT * sizeof(uint32_t));
-   if (!scaled_buffer)
-      scaled_buffer = (uint32_t *)malloc((size_t)CAPTURE_MAX_WIDTH * CAPTURE_MAX_HEIGHT * sizeof(uint32_t));
-   if (!capture_buffer || !scaled_buffer)
-   {
-      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Out of memory.\n");
-      return false;
-   }
-
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "Core started (version %s).\n", CORE_VERSION);
 
    active_device_id[0] = '\0';
-   capture_sequence    = 0;
    read_image_options();
    apply_device_selection(true);
 
    /* retro_get_system_av_info() is called after this: report the device rate directly. */
-   output_fps = device_fps();
+   output_fps = valid_fps(capture_get_frame_rate());
    return true;
 }
 

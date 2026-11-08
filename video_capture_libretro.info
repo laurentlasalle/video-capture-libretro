@@ -6,7 +6,7 @@ corename = "Video Capture Device"
 categories = "Video"
 license = "MIT"
 permissions = ""
-display_version = "0.2.1"
+display_version = "0.2.2"
 
 # Hardware Information
 manufacturer = "N/A"

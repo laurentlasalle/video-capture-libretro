@@ -4,8 +4,8 @@
  * Opens a video capture device through an asynchronous IMFSourceReader.
  * The device's native format is chosen explicitly, then the source reader's
  * video processor converts it to RGB32, which matches libretro's XRGB8888.
- * Each received frame is copied into a shared buffer; the core picks up the
- * most recent one in retro_run().
+ * Each received frame is copied once, into a triple buffer; the core picks up
+ * the most recent one in retro_run() by swapping pointers.
  *
  * Copyright (c) 2026 Laurent LaSalle
  * SPDX-License-Identifier: MIT
@@ -30,6 +30,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "capture.h"
@@ -168,21 +169,40 @@ struct mf_scope
 };
 
 /* ------------------------------------------------------------------------ */
-/* Shared frame state                                                        */
+/* Shared frame state (triple buffering)                                     */
 /* ------------------------------------------------------------------------ */
 
-static std::mutex            g_frame_mutex;
-static std::vector<uint32_t> g_frame;        /* Latest frame, tightly packed */
-static unsigned              g_frame_width;
-static unsigned              g_frame_height;
-static uint64_t              g_frame_sequence;
+/*
+ * Three frame slots rotate between the device and the core without copying:
+ *   - write: filled by the Media Foundation callback thread;
+ *   - ready: the most recent complete frame;
+ *   - read:  owned by the core until its next capture_acquire_frame() call.
+ * A finished write slot is swapped with the ready slot; the core swaps the
+ * ready slot with its read slot. A frame the core never picked up is simply
+ * overwritten, so there is no queue and no added latency.
+ */
+struct frame_slot
+{
+   std::vector<uint32_t> pixels;
+   unsigned width  = 0;
+   unsigned height = 0;
+};
 
-/* Current output format of the source reader (guarded by g_frame_mutex). */
-static UINT32 g_out_width;
-static UINT32 g_out_height;
-static LONG   g_out_stride;
-static double g_out_frame_rate;
-static bool   g_warned_oversize;
+static frame_slot  g_slots[3];
+static frame_slot *g_write_slot = &g_slots[0];
+static frame_slot *g_ready_slot = &g_slots[1];
+static frame_slot *g_read_slot  = &g_slots[2];
+static bool        g_ready_is_new;
+static std::mutex  g_slot_mutex; /* Guards the slot pointers and g_ready_is_new */
+
+/* Current output format of the source reader. Written by update_output_format()
+ * and read by the callback thread; guarded by g_format_mutex. */
+static std::mutex g_format_mutex;
+static UINT32     g_out_width;
+static UINT32     g_out_height;
+static LONG       g_out_stride;
+static double     g_out_frame_rate;
+static bool       g_warned_oversize;
 
 static std::atomic<bool> g_running(false);
 
@@ -203,7 +223,7 @@ static void update_output_format(IMFSourceReader *reader)
    safe_release(&type);
 
    {
-      std::lock_guard<std::mutex> lock(g_frame_mutex);
+      std::lock_guard<std::mutex> lock(g_format_mutex);
       g_out_width       = width;
       g_out_height      = height;
       g_out_stride      = stride;
@@ -216,46 +236,56 @@ static void update_output_format(IMFSourceReader *reader)
          (long)stride);
 }
 
-static void copy_rows(const BYTE *scan0, LONG pitch, unsigned width, unsigned height)
+/* Copies a locked image into the write slot. `pitch` is in bytes and may be
+ * negative for bottom-up images; scan0 always points to the top row. */
+static void copy_to_write_slot(const BYTE *scan0, LONG pitch, unsigned width, unsigned height)
 {
-   /* Called with g_frame_mutex held. */
-   g_frame.resize((size_t)width * height);
+   frame_slot *slot = g_write_slot; /* Only this thread touches the write slot */
 
-   for (unsigned y = 0; y < height; y++)
-      memcpy(&g_frame[(size_t)y * width], scan0 + (ptrdiff_t)y * pitch, (size_t)width * 4);
+   slot->pixels.resize((size_t)width * height); /* Allocates only when the size grows */
+   slot->width  = width;
+   slot->height = height;
 
-   g_frame_width  = width;
-   g_frame_height = height;
-   g_frame_sequence++;
+   if (pitch == (LONG)(width * 4))
+      memcpy(slot->pixels.data(), scan0, (size_t)width * height * 4);
+   else
+      for (unsigned y = 0; y < height; y++)
+         memcpy(&slot->pixels[(size_t)y * width], scan0 + (ptrdiff_t)y * pitch, (size_t)width * 4);
+
+   /* Publish: the finished frame becomes the ready one. */
+   std::lock_guard<std::mutex> lock(g_slot_mutex);
+   std::swap(g_write_slot, g_ready_slot);
+   g_ready_is_new = true;
 }
 
 static void store_sample(IMFSample *sample)
 {
    IMFMediaBuffer *buffer = nullptr;
    IMF2DBuffer *buffer2d  = nullptr;
+   unsigned width, height;
+   LONG default_stride;
+
+   {
+      std::lock_guard<std::mutex> lock(g_format_mutex);
+      width          = g_out_width;
+      height         = g_out_height;
+      default_stride = g_out_stride;
+
+      if (width == 0 || height == 0)
+         return;
+
+      if (width > CAPTURE_MAX_WIDTH || height > CAPTURE_MAX_HEIGHT)
+      {
+         if (!g_warned_oversize)
+            log_message(CAPTURE_LOG_WARN, "Frame %ux%u exceeds the %ux%u limit, ignoring.",
+                  width, height, CAPTURE_MAX_WIDTH, CAPTURE_MAX_HEIGHT);
+         g_warned_oversize = true;
+         return;
+      }
+   }
 
    if (FAILED(sample->ConvertToContiguousBuffer(&buffer)))
       return;
-
-   std::lock_guard<std::mutex> lock(g_frame_mutex);
-   const unsigned width  = g_out_width;
-   const unsigned height = g_out_height;
-
-   if (width == 0 || height == 0)
-   {
-      safe_release(&buffer);
-      return;
-   }
-
-   if (width > CAPTURE_MAX_WIDTH || height > CAPTURE_MAX_HEIGHT)
-   {
-      if (!g_warned_oversize)
-         log_message(CAPTURE_LOG_WARN, "Frame %ux%u exceeds the %ux%u limit, ignoring.",
-               width, height, CAPTURE_MAX_WIDTH, CAPTURE_MAX_HEIGHT);
-      g_warned_oversize = true;
-      safe_release(&buffer);
-      return;
-   }
 
    /* Prefer IMF2DBuffer: it gives the real pitch and first-row pointer,
     * including for bottom-up images (negative pitch). */
@@ -266,25 +296,25 @@ static void store_sample(IMFSample *sample)
 
       if (SUCCEEDED(buffer2d->Lock2D(&scan0, &pitch)))
       {
-         copy_rows(scan0, pitch, width, height);
+         copy_to_write_slot(scan0, pitch, width, height);
          buffer2d->Unlock2D();
       }
       safe_release(&buffer2d);
    }
    else
    {
-      BYTE *data      = nullptr;
-      DWORD max_len   = 0;
-      DWORD cur_len   = 0;
-      LONG pitch      = g_out_stride ? g_out_stride : (LONG)(width * 4);
-      LONG abs_pitch  = pitch < 0 ? -pitch : pitch;
+      BYTE *data     = nullptr;
+      DWORD max_len  = 0;
+      DWORD cur_len  = 0;
+      LONG pitch     = default_stride ? default_stride : (LONG)(width * 4);
+      LONG abs_pitch = pitch < 0 ? -pitch : pitch;
 
       if (SUCCEEDED(buffer->Lock(&data, &max_len, &cur_len)))
       {
          if ((size_t)cur_len >= (size_t)abs_pitch * height && abs_pitch >= (LONG)(width * 4))
          {
             const BYTE *scan0 = pitch < 0 ? data + (size_t)abs_pitch * (height - 1) : data;
-            copy_rows(scan0, pitch, width, height);
+            copy_to_write_slot(scan0, pitch, width, height);
          }
          buffer->Unlock();
       }
@@ -313,8 +343,21 @@ public:
    }
 
    /* Non-owning: the reader holds a reference to us, not the reverse. */
-   void set_reader(IMFSourceReader *reader) { reader_ = reader; }
-   void set_stopping() { stopping_ = true; }
+   void set_reader(IMFSourceReader *reader)
+   {
+      std::lock_guard<std::mutex> lock(request_mutex_);
+      reader_ = reader;
+   }
+
+   /* After this returns, the callback never requests another frame, so the
+    * reader can be flushed and released safely. */
+   void set_stopping()
+   {
+      std::lock_guard<std::mutex> lock(request_mutex_);
+      stopping_ = true;
+      reader_   = nullptr;
+   }
+
    HANDLE flush_event() const { return flush_event_; }
 
    STDMETHODIMP QueryInterface(REFIID iid, void **ppv) override
@@ -369,13 +412,21 @@ public:
          return S_OK;
       }
 
+      /* The sample delivered with this flag already uses the new format. */
       if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)
+      {
+         std::lock_guard<std::mutex> lock(request_mutex_);
+         if (stopping_ || !reader_)
+            return S_OK;
          update_output_format(reader_);
+      }
 
       if (sample)
          store_sample(sample);
 
-      /* Request the next frame. */
+      /* Request the next frame, unless capture_stop() is in progress. The lock
+       * keeps the reader alive for the duration of the request. */
+      std::lock_guard<std::mutex> lock(request_mutex_);
       if (!stopping_ && reader_)
       {
          HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
@@ -406,6 +457,7 @@ public:
 
 private:
    volatile LONG     ref_count_;
+   std::mutex        request_mutex_; /* Guards reader_ and stopping_ during requests */
    IMFSourceReader  *reader_;
    std::atomic<bool> stopping_;
    HANDLE            flush_event_;
@@ -512,6 +564,7 @@ static void release_session(void)
 
    if (g_reader && g_callback)
    {
+      /* Cancel the pending request; OnFlush() signals when it is done. */
       ResetEvent(g_callback->flush_event());
       if (SUCCEEDED(g_reader->Flush((DWORD)MF_SOURCE_READER_ALL_STREAMS)))
       {
@@ -682,6 +735,12 @@ extern "C" bool capture_start(const char *id)
 
    update_output_format(g_reader);
 
+   /* Forget any frame left by a previous device. */
+   {
+      std::lock_guard<std::mutex> lock(g_slot_mutex);
+      g_ready_is_new = false;
+   }
+
    /* Start streaming: each OnReadSample requests the next frame. */
    g_callback->set_reader(g_reader);
    g_running = true;
@@ -710,20 +769,23 @@ extern "C" bool capture_is_running(void)
 
 extern "C" double capture_get_frame_rate(void)
 {
-   std::lock_guard<std::mutex> lock(g_frame_mutex);
+   std::lock_guard<std::mutex> lock(g_format_mutex);
    return g_out_frame_rate;
 }
 
-extern "C" bool capture_fetch_frame(uint32_t *dst, unsigned *width, unsigned *height, uint64_t *sequence)
+extern "C" bool capture_acquire_frame(capture_frame_t *frame)
 {
-   std::lock_guard<std::mutex> lock(g_frame_mutex);
+   {
+      std::lock_guard<std::mutex> lock(g_slot_mutex);
+      if (!g_ready_is_new)
+         return false;
+      std::swap(g_read_slot, g_ready_slot);
+      g_ready_is_new = false;
+   }
 
-   if (g_frame_sequence == *sequence || g_frame.empty())
-      return false;
-
-   memcpy(dst, g_frame.data(), g_frame.size() * sizeof(uint32_t));
-   *width    = g_frame_width;
-   *height   = g_frame_height;
-   *sequence = g_frame_sequence;
+   frame->pixels     = g_read_slot->pixels.data();
+   frame->width      = g_read_slot->width;
+   frame->height     = g_read_slot->height;
+   frame->frame_rate = capture_get_frame_rate();
    return true;
 }

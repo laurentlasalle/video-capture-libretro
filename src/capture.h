@@ -40,6 +40,15 @@ enum capture_log_level
 
 typedef void (*capture_log_t)(enum capture_log_level level, const char *message);
 
+/* A captured frame handed over to the core. */
+typedef struct capture_frame
+{
+   const uint32_t *pixels;     /* XRGB8888, tightly packed (pitch = width) */
+   unsigned        width;
+   unsigned        height;
+   double          frame_rate; /* Frames per second, or 0 if unknown */
+} capture_frame_t;
+
 /* Sets the function used by the backend to report messages. */
 void capture_set_logger(capture_log_t logger);
 
@@ -56,13 +65,18 @@ void capture_stop(void);
 /* True while the device is open and has not reported an error. */
 bool capture_is_running(void);
 
-/* Frame rate of the current stream in frames per second, or 0 if unknown. */
+/* Frame rate of the current stream in frames per second, or 0 if unknown.
+ * Known as soon as capture_start() succeeds, before the first frame. */
 double capture_get_frame_rate(void);
 
-/* Copies the most recent frame into `dst` (XRGB8888, tightly packed, at most
- * CAPTURE_MAX_WIDTH x CAPTURE_MAX_HEIGHT) if it is newer than `*sequence`.
- * On success, updates `*width`, `*height` and `*sequence` and returns true. */
-bool capture_fetch_frame(uint32_t *dst, unsigned *width, unsigned *height, uint64_t *sequence);
+/* Hands over the most recent frame if one arrived since the previous call.
+ * Returns false when there is no new frame.
+ *
+ * No copy is made: the backend keeps three buffers (one being written by the
+ * device, one holding the latest complete frame, one owned by the core) and
+ * swaps pointers. Older frames are dropped, never queued, so latency stays
+ * minimal. `frame->pixels` stays valid until the next call to this function. */
+bool capture_acquire_frame(capture_frame_t *frame);
 
 #ifdef __cplusplus
 }
