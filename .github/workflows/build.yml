@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ['v*']   # A version tag (v1.0.0) also publishes a GitHub Release
   pull_request:
   workflow_dispatch:
 
@@ -12,7 +11,7 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     permissions:
-      contents: write  # Needed only to publish releases from version tags
+      contents: write  # Needed only to publish releases
     steps:
       - uses: actions/checkout@v4
 
@@ -38,15 +37,24 @@ jobs:
           name: video_capture_libretro-windows-x64
           path: dist/
 
-      # On a version tag: zip the DLL and the .info file, write their SHA-256
-      # checksums, and publish both as a GitHub Release.
+      # Releases follow the version in CMakeLists.txt: on a push to main, if
+      # no release exists yet for that version, zip the DLL and the .info
+      # file, write their SHA-256 checksums, and publish them as a GitHub
+      # Release, tagged v<version> on this commit. Publishing a new version
+      # is therefore a matter of raising the version number.
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = "${{ github.ref_name }}"
+          $match = Select-String -Path CMakeLists.txt -Pattern 'project\(\S+ VERSION (\d+\.\d+\.\d+)'
+          $version = "v" + $match.Matches[0].Groups[1].Value
+          gh release view $version *> $null
+          if ($LASTEXITCODE -eq 0) {
+             Write-Output "Release $version already exists."
+             exit 0
+          }
           $zip = "video_capture_libretro-$version-windows-x64.zip"
           Compress-Archive -Path dist/* -DestinationPath $zip
           $files = @($zip, "dist/video_capture_libretro.dll", "dist/video_capture_libretro.info")
@@ -54,7 +62,7 @@ jobs:
              "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), (Split-Path $_ -Leaf)
            }) | Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
-          gh release create $version $zip SHA256SUMS.txt --title "Video Capture Device $version" --notes-file RELEASE_NOTES.md
+          gh release create $version $zip SHA256SUMS.txt --target "${{ github.sha }}" --title "Video Capture Device $version" --notes-file RELEASE_NOTES.md
 
   linux:
     # Not a target yet; built only to keep the code portable.
