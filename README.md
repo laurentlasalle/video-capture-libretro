@@ -38,7 +38,7 @@ Close OBS or any other application using the device first: most capture devices 
 | Color Range | Limited, Full | Shown when Color Conversion is set to Core. *Limited* is standard for video (black at 16, white at 235). Use *Full* if blacks look gray or colors look washed out. |
 | Show Capture Stats | Off, On-Screen Notification, In Image | Three frame rates, measured every second: *Capture* (frames received from the device), *RetroArch* (calls to the core) and *Output* (new frames shown). In the image, each line is green when the rate is as expected, white when slightly low, red when frames are being lost. A low RetroArch rate means the frontend or a heavy shader cannot keep up; a normal RetroArch rate with a low Output rate means frames are lost to uneven timing. *In Image* draws the text into the picture, before shaders. |
 | Log Capture Stats | Off, On | Shown when Show Capture Stats is on. Writes the stats every second, with the age of each frame when shown, to `video_capture_stats.log` in RetroArch's save directory. |
-| No Signal Details | Off, On | Shows the reason and troubleshooting hints on the No Signal screen. |
+| No Signal Details | On, Off | Shows the cause and troubleshooting hints on the No Signal screen. On by default. |
 
 Resolution and aspect ratio are independent: 640x480 with 16:9 gives an anamorphic image, like a DVD. For the core's aspect ratio to be used, set **Settings > Video > Scaling > Aspect Ratio** to **Core Provided**. A shader preset may still force its own aspect ratio.
 

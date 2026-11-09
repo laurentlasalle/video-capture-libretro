@@ -40,7 +40,7 @@ enum color_space_option opt_color_space    = COLOR_SPACE_DEFAULT;
 enum color_range        opt_color_range    = COLOR_RANGE_LIMITED;
 enum stats_mode         opt_stats          = STATS_OFF;
 bool                    opt_stats_log      = false;
-bool                    opt_details        = false;
+bool                    opt_details        = true;
 bool                    opt_smooth_pacing  = true;
 
 capture_device_t devices[CAPTURE_MAX_DEVICES];
@@ -83,6 +83,9 @@ static const char *const stats_values[] = {
 };
 static const char *const off_on_values[] = {
    "off", "Off", "on", "On", NULL
+};
+static const char *const on_off_values[] = {
+   "on", "On", "off", "Off", NULL
 };
 
 /* Crop values, built at startup: "0" / "Off", "4" / "4 px", "8" / "8 px"... */
@@ -164,7 +167,7 @@ static const struct option_spec option_specs[] = {
      off_on_values },
    { "diagnostics", OPTION_DETAILS, "No Signal Details",
      "Shows the cause and troubleshooting hints on the No Signal screen.",
-     off_on_values },
+     on_off_values },
 };
 
 #define OPTION_SPEC_COUNT (sizeof(option_specs) / sizeof(option_specs[0]))
