@@ -4,7 +4,7 @@ A [libretro](https://www.libretro.com/) core that displays a live video capture 
 
 It works like OBS Studio's *Video Capture Device* source, but the image goes through RetroArch's shader pipeline instead.
 
-> **Status: experimental.** Video and audio capture work on Windows.
+> **Version 1.0.** Video and audio capture work on Windows 10 and later. Linux and macOS are not supported yet.
 
 ## Why
 
@@ -12,7 +12,7 @@ CRT and VHS shaders are designed for low-resolution input. A capture card usuall
 
 ## Installation (Windows)
 
-1. Download the latest build from the [Actions](../../actions) tab (artifact `video_capture_libretro-windows-x64`).
+1. Download the zip of the latest version from the [Releases](../../releases) page. Its SHA-256 checksums are listed in `SHA256SUMS.txt`. Builds of the latest changes are also available from the [Actions](../../actions) tab (artifact `video_capture_libretro-windows-x64`).
 2. Copy `video_capture_libretro.dll` into RetroArch's `cores` folder.
 3. Copy `video_capture_libretro.info` into RetroArch's `info` folder (see **Settings > Directory > Core Info**). If the core still shows as `video_capture_libretro.dll`, close RetroArch and delete `core_info.cache` in that folder.
 4. In RetroArch, use **Load Core**, select **Video Capture Device**, then **Start Core**.
@@ -50,7 +50,16 @@ The core shows color bars with a message instead of a black screen when:
 - **DEVICE ERROR**: the device could not be opened, for example because another application uses it. The core retries every 3 seconds;
 - **NO SIGNAL**: the device sends no frames for 2 seconds, or sends perfectly black frames for 1 second. Capture devices without input signal often send digitally generated black; analog video, even on a black scene, always has some noise, so it is not mistaken for a missing signal.
 
-Set **No Signal Details** to **On** for the exact reason and hints.
+With **No Signal Details** set to **On** (the default), the screen also gives the exact reason and troubleshooting hints:
+
+| | |
+|---|---|
+| ![NO SIGNAL: the device receives no picture from its source](docs/images/no-signal-black.png) | ![NO SIGNAL: the device sends no frames](docs/images/no-signal-frames.png) |
+| ![DEVICE ERROR: the device is in use by another application](docs/images/device-error.png) | ![NO DEVICE: no capture device was found](docs/images/no-device.png) |
+
+With **No Signal Details** set to **Off**, only the title and the device name are shown:
+
+![NO SIGNAL with No Signal Details set to Off](docs/images/no-signal-off.png)
 
 ## Saving settings per source (.vidcap files)
 
@@ -107,7 +116,9 @@ Windows may also play the same input through **Listen to this device** (Sound se
 - [x] Color conversion in the core, Rec. 601/709, limited/full range
 - [x] No Signal screen, capture stats, `.vidcap` files
 - [x] Audio capture, with dynamic resampling to compensate for clock drift
-- [ ] First release
+- [x] First release (1.0.0)
+- [ ] Distribution through RetroArch's Online Updater (libretro buildbot)
+- [ ] Linux capture (V4L2) and macOS capture (AVFoundation)
 
 ## Building
 

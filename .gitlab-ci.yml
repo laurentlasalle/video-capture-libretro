@@ -1,0 +1,39 @@
+# DESCRIPTION: GitLab CI/CD for libretro's build infrastructure (NOT FOR GitLab-proper).
+#
+# Builds the core on libretro's buildbot, which mirrors this repository.
+# Only Windows is built: the capture backends (Media Foundation for video,
+# WASAPI for audio) are Windows-only for now. On other platforms the core
+# builds, but can only show its No Signal screen.
+
+##############################################################################
+################################# BOILERPLATE ################################
+##############################################################################
+
+# Core definitions
+.core-defs:
+  variables:
+    CORENAME: video_capture
+    CORE_ARGS: -DCMAKE_BUILD_TYPE=Release
+
+# Inclusion templates, required for the build to work
+include:
+  ################################## DESKTOPS ################################
+  # Windows
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/windows-cmake-msvc19.yml'
+
+# Stages for building
+stages:
+  - build-prepare
+  - build-shared
+
+##############################################################################
+#################################### STAGES ##################################
+##############################################################################
+#
+################################### DESKTOPS #################################
+# Windows 64-bit
+libretro-build-windows-x64:
+  extends:
+    - .libretro-windows-msvc19-cmake-x86_64
+    - .core-defs

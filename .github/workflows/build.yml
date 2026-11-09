@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']   # A version tag (v1.0.0) also publishes a GitHub Release
   pull_request:
   workflow_dispatch:
 
@@ -10,6 +11,8 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    permissions:
+      contents: write  # Needed only to publish releases from version tags
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +37,24 @@ jobs:
         with:
           name: video_capture_libretro-windows-x64
           path: dist/
+
+      # On a version tag: zip the DLL and the .info file, write their SHA-256
+      # checksums, and publish both as a GitHub Release.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}"
+          $zip = "video_capture_libretro-$version-windows-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip
+          $files = @($zip, "dist/video_capture_libretro.dll", "dist/video_capture_libretro.info")
+          ($files | ForEach-Object {
+             "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), (Split-Path $_ -Leaf)
+           }) | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          gh release create $version $zip SHA256SUMS.txt --title "Video Capture Device $version" --notes-file RELEASE_NOTES.md
 
   linux:
     # Not a target yet; built only to keep the code portable.
