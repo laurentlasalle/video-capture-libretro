@@ -124,6 +124,8 @@ static enum aspect_mode        opt_aspect      = ASPECT_SOURCE;
 static unsigned                opt_capture_height; /* Preferred device format height, 0 for Auto */
 static unsigned                opt_crop_h;      /* Pixels removed on the left and on the right */
 static unsigned                opt_crop_v;      /* Pixels removed at the top and at the bottom */
+static unsigned                crop_size_width;  /* Captured size the crop values apply to, 0 if unknown */
+static unsigned                crop_size_height;
 static bool                    opt_core_convert = true;
 static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
 static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
@@ -866,9 +868,9 @@ static void log_session_stats(void)
 {
    /* The session ends at the last retro_run(): time spent in RetroArch's menu
     * before closing the content is not counted. */
-   const retro_time_t now = last_run_usec > session_start_time ? last_run_usec :
-                            perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
-   const uint64_t received = capture_frames_received() - session_paused_frames;
+   const bool at_last_run  = last_run_usec > session_start_time;
+   const retro_time_t now  = at_last_run ? last_run_usec : perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const uint64_t received = (at_last_run ? last_run_received : capture_frames_received()) - session_paused_frames;
    double seconds, paused;
 
    if (!now || !session_start_time || !received)
@@ -960,27 +962,126 @@ static void apply_device_selection(bool force)
    stats_lines[0][0]   = '\0';
 }
 
-/* True if `text` contains `part`, ignoring ASCII case. */
-static bool contains_ignoring_case(const char *text, const char *part)
+/* Shows a message for `duration_ms` in RetroArch's notifications. */
+static void show_notification(const char *text, unsigned duration_ms)
 {
-   size_t i, j;
-
-   if (!part[0])
-      return false;
-   for (i = 0; text[i]; i++)
+   if (message_interface_version >= 1)
    {
-      for (j = 0; part[j] && text[i + j]; j++)
-         if (tolower((unsigned char)text[i + j]) != tolower((unsigned char)part[j]))
-            break;
-      if (!part[j])
-         return true;
+      struct retro_message_ext message;
+
+      message.msg      = text;
+      message.duration = duration_ms;
+      message.priority = 1;
+      message.level    = RETRO_LOG_INFO;
+      message.target   = RETRO_MESSAGE_TARGET_OSD;
+      message.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+      message.progress = -1;
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
+   }
+   else
+   {
+      struct retro_message message;
+
+      message.msg    = text;
+      message.frames = (unsigned)(output_fps * duration_ms / 1000.0);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+   }
+}
+
+/* Copies the letters and digits of `text` to `out`, in lowercase: "Cam Link
+ * Pro HDMI-4" becomes "camlinkprohdmi4". */
+static void simplify_name(const char *text, char *out, size_t size)
+{
+   size_t n = 0;
+
+   for (; *text && n + 1 < size; text++)
+      if (isalnum((unsigned char)*text))
+         out[n++] = (char)tolower((unsigned char)*text);
+   out[n] = '\0';
+}
+
+/* True if `text` contains the number `number` on its own: "Audio-4" contains
+ * 4, "Audio-14" does not. */
+static bool contains_number(const char *text, unsigned long number)
+{
+   while (*text)
+   {
+      if (isdigit((unsigned char)*text))
+      {
+         char *end;
+         const unsigned long value = strtoul(text, &end, 10);
+
+         if (value == number)
+            return true;
+         text = end;
+      }
+      else
+         text++;
    }
    return false;
 }
 
-/* Opens the audio input selected in the core options. Auto picks the first
- * input whose name contains the capture device's name, such as "Digital Audio
- * Interface (Cam Link Pro HDMI-4)" for "Cam Link Pro HDMI-4". Without
+/*
+ * Returns the index of the audio input that goes with the capture device
+ * `video`, or -1. Device makers name them differently, for example:
+ *   "Elgato 4K X"         -> "Digital Audio Interface (Elgato 4K X)"
+ *   "Cam Link Pro HDMI-4" -> "Cam Link Pro Audio-4 (Cam Link Pro)"
+ * First, an input whose name contains the device's name (letters and digits
+ * only, ignoring case). Otherwise, if the device's name contains a number (the
+ * input number of a multi-input device), an input whose name contains both
+ * the text before the word holding that number ("Cam Link Pro") and the same
+ * number.
+ */
+static int match_audio_input(const char *video)
+{
+   char video_simple[300], audio_simple[300], base[300], base_simple[300];
+   const char *number_start = NULL, *word_start, *p;
+   unsigned long number;
+   size_t base_len;
+   int i;
+
+   simplify_name(video, video_simple, sizeof(video_simple));
+   if (!video_simple[0])
+      return -1;
+
+   for (i = 0; i < audio_device_count; i++)
+   {
+      simplify_name(audio_devices[i].name, audio_simple, sizeof(audio_simple));
+      if (strstr(audio_simple, video_simple))
+         return i;
+   }
+
+   /* Last number of the device's name, and the word holding it. */
+   for (p = video; *p; p++)
+      if (isdigit((unsigned char)*p) && (p == video || !isdigit((unsigned char)p[-1])))
+         number_start = p;
+   if (!number_start)
+      return -1;
+   number = strtoul(number_start, NULL, 10);
+
+   word_start = number_start;
+   while (word_start > video && word_start[-1] != ' ')
+      word_start--;
+   base_len = (size_t)(word_start - video);
+   if (base_len == 0 || base_len >= sizeof(base))
+      return -1;
+   memcpy(base, video, base_len);
+   base[base_len] = '\0';
+   simplify_name(base, base_simple, sizeof(base_simple));
+   if (!base_simple[0])
+      return -1;
+
+   for (i = 0; i < audio_device_count; i++)
+   {
+      simplify_name(audio_devices[i].name, audio_simple, sizeof(audio_simple));
+      if (strstr(audio_simple, base_simple) && contains_number(audio_devices[i].name, number))
+         return i;
+   }
+   return -1;
+}
+
+/* Opens the audio input selected in the core options; Auto uses
+ * match_audio_input() and shows its choice in a notification. Without
  * `force`, nothing happens if that input is already open. */
 static void apply_audio_selection(bool force)
 {
@@ -989,11 +1090,7 @@ static void apply_audio_selection(bool force)
    int index = -1, i;
 
    if (auto_select)
-   {
-      for (i = 0; i < audio_device_count && index < 0; i++)
-         if (contains_ignoring_case(audio_devices[i].name, active_device_name))
-            index = i;
-   }
+      index = match_audio_input(active_device_name);
    else if (value && !option_is(value, AUDIO_OFF))
    {
       for (i = 0; i < audio_device_count && index < 0; i++)
@@ -1012,13 +1109,22 @@ static void apply_audio_selection(bool force)
 
    if (index < 0)
    {
-      if (auto_select)
+      if (auto_select && active_device_name[0])
       {
-         log_cb(RETRO_LOG_WARN, LOG_PREFIX "No audio input name contains \"%s\"; select one in Audio Input.\n",
+         log_cb(RETRO_LOG_WARN, LOG_PREFIX "No audio input matches \"%s\"; select one in Audio Input.\n",
                active_device_name);
-         stats_log_printf("Audio: no input name contains \"%s\".", active_device_name);
+         stats_log_printf("Audio: no input matches \"%s\".", active_device_name);
+         show_notification("Audio Input: no input matches the capture device, select one manually.", 5000);
       }
       return;
+   }
+
+   if (auto_select)
+   {
+      char text[320];
+
+      snprintf(text, sizeof(text), "Audio Input: %s", option_audio_names[index]);
+      show_notification(text, 4000);
    }
 
    if (audio_start(audio_devices[index].id))
@@ -1263,6 +1369,71 @@ static double measure_frame_rate(const capture_frame_t *frame)
    stats_log_printf("Measured frame rate: %.3f fps (device declares %.3f), reporting %.3f fps to RetroArch.",
          measured, rate_nominal, rate_reported);
    return rate_reported;
+}
+
+/* Rounds `value` to the nearest multiple of `step`, at most `max`. */
+static unsigned round_to_step(double value, unsigned step, unsigned max)
+{
+   const unsigned rounded = (unsigned)(value / step + 0.5) * step;
+   return rounded > max ? max : rounded;
+}
+
+/*
+ * Keeps the crop on the same part of the picture when the captured size
+ * changes, for example from 1920x1080 to 1280x720 after changing Capture
+ * Resolution: the crop values are pixels of the captured image, so they are
+ * scaled by the same ratio and rounded to the options' steps (384 x 36 at
+ * 1080p becomes 256 x 24 at 720p). The new values are written to the core
+ * options, so the menu shows them. If the frontend cannot change option
+ * values, the values to enter are written to the logs instead.
+ */
+static void convert_crop_to_size(unsigned width, unsigned height)
+{
+   const unsigned old_width = crop_size_width, old_height = crop_size_height;
+   unsigned crop_h, crop_v;
+   char value_h[16], value_v[16];
+   struct retro_variable var;
+   bool set = true;
+
+   crop_size_width  = width;
+   crop_size_height = height;
+
+   if (!old_width || !old_height || (old_width == width && old_height == height) ||
+       (!opt_crop_h && !opt_crop_v))
+      return;
+
+   crop_h = round_to_step((double)opt_crop_h * width / old_width, CROP_H_STEP, CROP_H_STEP * (CROP_VALUES - 1));
+   crop_v = round_to_step((double)opt_crop_v * height / old_height, CROP_V_STEP, CROP_V_STEP * (CROP_VALUES - 1));
+   if (crop_h == opt_crop_h && crop_v == opt_crop_v)
+      return;
+
+   snprintf(value_h, sizeof(value_h), "%u", crop_h);
+   snprintf(value_v, sizeof(value_v), "%u", crop_v);
+
+   var.key   = OPTION_CROP_H;
+   var.value = value_h;
+   set = environ_cb(RETRO_ENVIRONMENT_SET_VARIABLE, &var);
+   var.key   = OPTION_CROP_V;
+   var.value = value_v;
+   set = environ_cb(RETRO_ENVIRONMENT_SET_VARIABLE, &var) && set;
+
+   if (set)
+   {
+      opt_crop_h = crop_h;
+      opt_crop_v = crop_v;
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Captured size changed from %ux%u to %ux%u: crop set to %u x %u px.\n",
+            old_width, old_height, width, height, crop_h, crop_v);
+      stats_log_printf("Captured size changed from %ux%u to %ux%u: crop set to %u x %u px.",
+            old_width, old_height, width, height, crop_h, crop_v);
+   }
+   else
+   {
+      log_cb(RETRO_LOG_WARN, LOG_PREFIX "Captured size changed from %ux%u to %ux%u: set Crop Horizontal to "
+            "%u px and Crop Vertical to %u px to keep the same crop.\n",
+            old_width, old_height, width, height, crop_h, crop_v);
+      stats_log_printf("Captured size changed from %ux%u to %ux%u: set Crop Horizontal to %u px and "
+            "Crop Vertical to %u px to keep the same crop.", old_width, old_height, width, height, crop_h, crop_v);
+   }
 }
 
 /* Makes sure rgb_buffer holds at least `pixels` pixels. */
@@ -1842,6 +2013,7 @@ static enum signal_state poll_capture(bool *new_frame)
          session_paused_frames = capture_frames_received() - 1;
       }
 
+      convert_crop_to_size(frame.width, frame.height);
       last_frame            = frame;
       have_frame            = true;
       seconds_without_frame = 0.0;
@@ -2117,6 +2289,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    apply_device_selection(true);
    active_audio_id[0] = '\0';
    apply_audio_selection(true);
+   crop_size_width  = 0;
+   crop_size_height = 0;
 
    /* retro_get_system_av_info() is called after this: report the device rate directly. */
    output_fps = valid_fps(capture_get_frame_rate());
