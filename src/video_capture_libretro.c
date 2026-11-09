@@ -208,7 +208,7 @@ static bool         waiting_first_run; /* Device opened, retro_run() not called 
 
 /* Frame rate measurement (see measure_frame_rate()). */
 #define RATE_MIN_USEC   10000000 /* Measure over at least 10 seconds */
-#define RATE_GAP_USEC   500000   /* A longer gap between frames restarts the measurement */
+#define RATE_GAP_USEC   500000   /* A longer interval between two device frames restarts the measurement */
 #define RATE_TOLERANCE  0.0004   /* Relative difference accepted between measured and reported rates */
 static uint64_t rate_anchor_sequence; /* First frame of the measurement, 0 if none */
 static int64_t  rate_anchor_usec;
@@ -217,24 +217,6 @@ static int64_t  rate_last_usec;
 static double   rate_nominal;         /* Rate declared by the device */
 static double   rate_reported;        /* Rate reported to RetroArch */
 
-/* Phase adjustment for Lowest Latency (see phase_adjust_factor()). */
-#define ADJUST_EVENTS         6      /* Drops or repeats within ADJUST_WINDOW_RUNS that start an adjustment */
-#define ADJUST_WINDOW_RUNS    120    /* About 2 seconds */
-#define ADJUST_MARGIN_MS      3.0    /* Average frame age this close to the collision zone starts an adjustment */
-#define ADJUST_FACTOR         1.005  /* RetroArch runs 0.5% faster or slower: the timing shifts by about 5 ms per second */
-#define ADJUST_SETTLED_FRAMES 5      /* Frames in a row halfway between two calls that end it */
-#define ADJUST_TIMEOUT_RUNS   600    /* Give up after about 10 seconds */
-#define ADJUST_COOLDOWN_RUNS  3600   /* Then wait about a minute before trying again */
-static uint64_t adjust_window_start;  /* retro_run() count when the event window started */
-static unsigned adjust_events;
-static bool     adjusting;
-static uint64_t adjust_start_run;
-static uint64_t adjust_cooldown_until;
-static unsigned adjust_settled_frames;
-static double   adjust_factor;        /* ADJUST_FACTOR or its inverse, while adjusting */
-static double   adjust_age_sum_ms;    /* Frame ages over the current window */
-static unsigned adjust_age_count;
-static uint64_t total_runs;           /* retro_run() calls since the core started */
 
 /* Age of each frame when shown (time between its arrival from the device and
  * retro_run()), over the current stats second. */
@@ -494,9 +476,8 @@ static void declare_core_options(void)
             "right when RetroArch asks for one. "
             "Smooth shows every frame in order: at those moments only, it adds up to one frame of latency "
             "(about 16 ms), and skips a single frame afterwards to catch up. Recommended to watch video. "
-            "Lowest Latency always shows the newest frame. At those moments, frames are dropped and repeated "
-            "until the core shifts the timing, which takes a few seconds and requires a variable refresh rate "
-            "display with Sync to Exact Content Framerate. Recommended to play games through the capture device.",
+            "Lowest Latency always shows the newest frame, but drops and repeats frames at those moments. "
+            "Recommended to play games through the capture device.",
             "smooth", pacing_values);
 
       define_option(def++, "color", OPTION_CONVERSION, "Color Conversion",
@@ -726,7 +707,10 @@ static int selected_device_index(void)
  * frames without watching the on-screen stats. */
 static void log_session_stats(void)
 {
-   const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   /* The session ends at the last retro_run(): time spent in RetroArch's menu
+    * before closing the content is not counted. */
+   const retro_time_t now = last_run_usec > session_start_time ? last_run_usec :
+                            perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
    const uint64_t received = capture_frames_received() - session_paused_frames;
    double seconds, paused;
 
@@ -797,11 +781,6 @@ static void apply_device_selection(bool force)
    pacing_resync        = false;
    rate_anchor_sequence = 0;
    rate_nominal         = 0.0;
-   adjusting             = false;
-   adjust_events         = 0;
-   adjust_cooldown_until = 0;
-   adjust_age_sum_ms     = 0.0;
-   adjust_age_count      = 0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -908,10 +887,12 @@ static double measure_frame_rate(const capture_frame_t *frame)
       rate_anchor_sequence = 0;
    }
 
-   /* First frame, or frames stopped for a while (signal lost): restart the
-    * measurement, keeping the rate reported so far. */
+   /* First frame, or the device stopped sending frames for a while (signal
+    * lost): restart the measurement, keeping the rate reported so far. Frames
+    * received while RetroArch was paused do not count as a gap: the interval
+    * is divided by the number of frames the device sent meanwhile. */
    if (!rate_anchor_sequence || frame->sequence <= rate_last_sequence ||
-       frame->arrival_usec - rate_last_usec > RATE_GAP_USEC)
+       (frame->arrival_usec - rate_last_usec) / (int64_t)(frame->sequence - rate_last_sequence) > RATE_GAP_USEC)
    {
       rate_anchor_sequence = frame->sequence;
       rate_anchor_usec     = frame->arrival_usec;
@@ -953,109 +934,6 @@ static double measure_frame_rate(const capture_frame_t *frame)
    }
 
    return rate_reported;
-}
-
-/* Counts dropped or repeated frames for phase_adjust_factor(). */
-static void note_collision(uint64_t frames)
-{
-   if (opt_smooth_pacing || adjusting)
-      return;
-
-   if (total_runs - adjust_window_start > ADJUST_WINDOW_RUNS)
-   {
-      adjust_window_start = total_runs;
-      adjust_events       = 0;
-   }
-   adjust_events += (unsigned)frames;
-}
-
-/*
- * With Lowest Latency, keeps frames away from the collision zone described in
- * pick_frame(). When the device and RetroArch run at the same rate, frames
- * arriving right when RetroArch asks for one keep doing so for a long time,
- * and frames are dropped and repeated all along.
- *
- * The adjustment starts when frames get close to that zone (their average age
- * over ADJUST_WINDOW_RUNS frames is within ADJUST_MARGIN_MS of 0 or of the
- * frame period), or when frames are already being dropped and repeated. The
- * core then reports a rate slightly lower or higher (ADJUST_FACTOR), so that
- * the timing moves away from the zone by the shorter way; with a variable
- * refresh rate display, RetroArch follows it and its calls drift relative to
- * the frames. Once frames arrive halfway between two calls, the normal rate
- * is reported again.
- *
- * Returns the factor to apply to the reported rate. `age_ms` is the age of
- * the frame just shown.
- */
-static double phase_adjust_factor(double age_ms)
-{
-   const double period_ms = 1000.0 / rate_reported;
-
-   if (opt_smooth_pacing)
-   {
-      adjusting = false;
-      return 1.0;
-   }
-
-   if (!adjusting)
-   {
-      bool close = false;
-      double average_ms;
-
-      adjust_age_sum_ms += age_ms;
-      adjust_age_count++;
-      average_ms = adjust_age_sum_ms / adjust_age_count;
-
-      if (adjust_age_count >= ADJUST_WINDOW_RUNS)
-      {
-         close = average_ms < ADJUST_MARGIN_MS || average_ms > period_ms - ADJUST_MARGIN_MS;
-         adjust_age_sum_ms = 0.0;
-         adjust_age_count  = 0;
-      }
-
-      if ((!close && adjust_events < ADJUST_EVENTS) || total_runs < adjust_cooldown_until)
-         return 1.0;
-
-      /* Frames arriving just before the calls (young): slow RetroArch down so
-       * its calls come later. Just after (old): speed it up. */
-      adjust_factor         = average_ms < period_ms / 2.0 ? 1.0 / ADJUST_FACTOR : ADJUST_FACTOR;
-      adjusting             = true;
-      adjust_start_run      = total_runs;
-      adjust_settled_frames = 0;
-      adjust_events         = 0;
-      adjust_age_sum_ms     = 0.0;
-      adjust_age_count      = 0;
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Frames arrive close to when RetroArch asks for one "
-            "(average age %.1f ms): shifting the timing.\n", average_ms);
-      stats_log_printf("Frames arrive close to when RetroArch asks for one (average age %.1f ms): "
-            "shifting the timing.", average_ms);
-   }
-
-   if (age_ms >= period_ms * 0.35 && age_ms <= period_ms * 0.65)
-   {
-      if (++adjust_settled_frames >= ADJUST_SETTLED_FRAMES)
-      {
-         adjusting = false;
-         log_cb(RETRO_LOG_INFO, LOG_PREFIX "Timing shifted in %.1f s.\n",
-               (double)(total_runs - adjust_start_run) / rate_reported);
-         stats_log_printf("Timing shifted in %.1f s.", (double)(total_runs - adjust_start_run) / rate_reported);
-         return 1.0;
-      }
-   }
-   else
-      adjust_settled_frames = 0;
-
-   if (total_runs - adjust_start_run > ADJUST_TIMEOUT_RUNS)
-   {
-      adjusting             = false;
-      adjust_cooldown_until = total_runs + ADJUST_COOLDOWN_RUNS;
-      log_cb(RETRO_LOG_WARN, LOG_PREFIX "Could not shift the timing: RetroArch does not follow the core's "
-            "frame rate. This requires a variable refresh rate display with Sync to Exact Content Framerate.\n");
-      stats_log_printf("Could not shift the timing: RetroArch does not follow the core's frame rate.");
-      return 1.0;
-   }
-
-   return adjust_factor;
 }
 
 /* Makes sure rgb_buffer holds at least `pixels` pixels. */
@@ -1580,7 +1458,6 @@ static bool pick_frame(capture_frame_t *frame)
    {
       stats_dropped   += pick - shown_sequence - 1;
       session_dropped += pick - shown_sequence - 1;
-      note_collision(pick - shown_sequence - 1);
    }
 
    shown_sequence = pick;
@@ -1631,15 +1508,13 @@ static enum signal_state poll_capture(bool *new_frame)
       if (frame.arrival_usec)
       {
          const double age_ms = (double)(capture_time_usec() - frame.arrival_usec) / 1000.0;
-         double fps;
 
          if (!frame_age_count || age_ms < frame_age_min_ms) frame_age_min_ms = age_ms;
          if (!frame_age_count || age_ms > frame_age_max_ms) frame_age_max_ms = age_ms;
          frame_age_sum_ms += age_ms;
          frame_age_count++;
 
-         fps = measure_frame_rate(&frame);
-         update_frame_rate(fps * phase_adjust_factor(age_ms));
+         update_frame_rate(measure_frame_rate(&frame));
       }
       else
          update_frame_rate(frame.frame_rate);
@@ -1651,7 +1526,6 @@ static enum signal_state poll_capture(bool *new_frame)
       {
          stats_repeated++;
          session_repeated++;
-         note_collision(1);
       }
    }
 
@@ -1825,7 +1699,6 @@ RETRO_API void retro_run(void)
 
    detect_pause();
    session_runs++;
-   total_runs++;
 
    if (input_poll_cb)
       input_poll_cb();
