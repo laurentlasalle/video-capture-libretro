@@ -25,6 +25,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <mftransform.h>
 
 #include <algorithm>
 #include <atomic>
@@ -784,6 +785,47 @@ static IMFMediaType *make_rgb32_type(IMFMediaType *native)
    return out;
 }
 
+/* MF_XVP_DISABLE_FRC (mfidl.h, Windows 8 and later), defined here so that
+ * older SDK headers also build. */
+static const GUID kXvpDisableFrc =
+   { 0x2c0afa19, 0x7a97, 0x4d5a, { 0x9e, 0xe8, 0x16, 0xd4, 0xfc, 0x51, 0x8d, 0x8c } };
+
+/*
+ * Turns off frame rate conversion in the video processor that the source
+ * reader inserts to convert to RGB32. Devices often declare a rate that differs
+ * from the signal (59.94 fps for a 60 fps source); the processor then drops or
+ * repeats frames to match the declared rate. Without conversion, frames are
+ * passed on as they arrive, and the core measures their real rate.
+ */
+static void disable_frame_rate_conversion(IMFSourceReader *reader)
+{
+   IMFSourceReaderEx *reader_ex = nullptr;
+   unsigned disabled = 0;
+
+   if (FAILED(reader->QueryInterface(IID_PPV_ARGS(&reader_ex))))
+      return;
+
+   for (DWORD index = 0;; index++)
+   {
+      IMFTransform  *transform  = nullptr;
+      IMFAttributes *attributes = nullptr;
+      GUID category;
+
+      if (FAILED(reader_ex->GetTransformForStream((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, index,
+            &category, &transform)))
+         break;
+      if (SUCCEEDED(transform->GetAttributes(&attributes)) &&
+          SUCCEEDED(attributes->SetUINT32(kXvpDisableFrc, TRUE)))
+         disabled++;
+      safe_release(&attributes);
+      safe_release(&transform);
+   }
+   safe_release(&reader_ex);
+
+   if (disabled)
+      log_message(CAPTURE_LOG_DEBUG, "Frame rate conversion disabled in %u video transform(s).", disabled);
+}
+
 static void release_session(void)
 {
    if (g_callback)
@@ -967,6 +1009,7 @@ extern "C" bool capture_start(const char *id, bool raw_yuv)
          release_session();
          return false;
       }
+      disable_frame_rate_conversion(g_reader);
    }
    safe_release(&native_type);
 

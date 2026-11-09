@@ -73,6 +73,14 @@
 #define OPTION_DETAILS     "video_capture_no_signal_details"
 #define OPTION_PACING      "video_capture_frame_pacing"
 #define OPTION_STATS_LOG   "video_capture_stats_log"
+#define OPTION_CROP_H      "video_capture_crop_horizontal"
+#define OPTION_CROP_V      "video_capture_crop_vertical"
+
+/* Crop options: pixels removed on each side. Horizontal steps are larger to
+ * fit RetroArch's limit of 128 values per option (127 plus the terminator). */
+#define CROP_VALUES   127
+#define CROP_H_STEP   4   /* 0 to 504 */
+#define CROP_V_STEP   2   /* 0 to 252; even, as NV12 rows come in pairs */
 #define DEVICE_AUTO        "auto"
 
 enum output_resolution
@@ -107,6 +115,8 @@ enum stats_mode
 /* Current option values */
 static enum output_resolution  opt_resolution  = RESOLUTION_NATIVE;
 static enum aspect_mode        opt_aspect      = ASPECT_SOURCE;
+static unsigned                opt_crop_h;      /* Pixels removed on the left and on the right */
+static unsigned                opt_crop_v;      /* Pixels removed at the top and at the bottom */
 static bool                    opt_core_convert = true;
 static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
 static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
@@ -210,12 +220,15 @@ static bool         waiting_first_run; /* Device opened, retro_run() not called 
 #define RATE_MIN_USEC   10000000 /* Measure over at least 10 seconds */
 #define RATE_GAP_USEC   500000   /* A longer interval between two device frames restarts the measurement */
 #define RATE_TOLERANCE  0.0004   /* Relative difference accepted between measured and reported rates */
+#define RATE_CONFIRM_USEC 5000000 /* A new rate must still match 5 seconds later */
 static uint64_t rate_anchor_sequence; /* First frame of the measurement, 0 if none */
 static int64_t  rate_anchor_usec;
 static uint64_t rate_last_sequence;
 static int64_t  rate_last_usec;
 static double   rate_nominal;         /* Rate declared by the device */
 static double   rate_reported;        /* Rate reported to RetroArch */
+static double   rate_candidate;       /* Rate found by the measurement, not confirmed yet */
+static int64_t  rate_candidate_usec;  /* Arrival time of the frame that found it */
 
 
 /* Age of each frame when shown (time between its arrival from the device and
@@ -242,10 +255,15 @@ static uint32_t     stats_colors[STATS_LINES];
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
-static struct retro_core_option_v2_definition option_definitions[11];
+static struct retro_core_option_v2_definition option_definitions[13];
 static struct retro_core_option_v2_category   option_categories[4];
 static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
-static struct retro_variable legacy_variables[11];
+static struct retro_variable legacy_variables[13];
+
+/* Crop option values and labels, built at startup ("0" / "Off", "4" / "4 px"). */
+static char        crop_text[2][CROP_VALUES][2][12];
+static const char *crop_values[2][CROP_VALUES * 2 + 1];
+static char        legacy_crop_values[2][CROP_VALUES * 5 + 32];
 
 /* ------------------------------------------------------------------------ */
 /* Logging                                                                   */
@@ -418,10 +436,44 @@ static const char *const stats_log_values[] = {
 
 static bool update_option_visibility(void);
 
+/* Fills crop_values[axis] with CROP_VALUES values, `step` pixels apart. */
+static void build_crop_values(int axis, unsigned step)
+{
+   int i;
+
+   for (i = 0; i < CROP_VALUES; i++)
+   {
+      snprintf(crop_text[axis][i][0], sizeof(crop_text[axis][i][0]), "%u", i * step);
+      if (i == 0)
+         snprintf(crop_text[axis][i][1], sizeof(crop_text[axis][i][1]), "Off");
+      else
+         snprintf(crop_text[axis][i][1], sizeof(crop_text[axis][i][1]), "%u px", i * step);
+      crop_values[axis][i * 2]     = crop_text[axis][i][0];
+      crop_values[axis][i * 2 + 1] = crop_text[axis][i][1];
+   }
+   crop_values[axis][CROP_VALUES * 2] = NULL;
+}
+
+/* Legacy format of the crop values: "Description; 0|4|8|...". */
+static const char *legacy_crop_option(int axis, const char *desc)
+{
+   char *out  = legacy_crop_values[axis];
+   size_t len = (size_t)snprintf(out, sizeof(legacy_crop_values[axis]), "%s; ", desc);
+   int i;
+
+   for (i = 0; i < CROP_VALUES && len < sizeof(legacy_crop_values[axis]); i++)
+      len += (size_t)snprintf(out + len, sizeof(legacy_crop_values[axis]) - len, i ? "|%s" : "%s",
+            crop_text[axis][i][0]);
+   return out;
+}
+
 static void declare_core_options(void)
 {
    unsigned version = 0;
    int i;
+
+   build_crop_values(0, CROP_H_STEP);
+   build_crop_values(1, CROP_V_STEP);
 
    if (!environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &version))
       version = 0;
@@ -439,7 +491,7 @@ static void declare_core_options(void)
        * in submenus. */
       option_categories[0].key  = "video";
       option_categories[0].desc = "Video";
-      option_categories[0].info = "Output resolution, aspect ratio and frame pacing.";
+      option_categories[0].info = "Output resolution, aspect ratio, crop and frame pacing.";
       option_categories[1].key  = "color";
       option_categories[1].desc = "Color";
       option_categories[1].info = "Conversion of the device's YUV picture to RGB.";
@@ -470,6 +522,16 @@ static void declare_core_options(void)
             "4:3 (Crop Pillarbox) keeps only the central 4:3 area, for a picture with black bars on the sides. "
             "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.",
             "source", aspect_values);
+
+      define_option(def++, "video", OPTION_CROP_H, "Crop Horizontal",
+            "Pixels of the captured image removed on the left and on the right, for example the black "
+            "borders around a pixel-perfect picture. Applied before Aspect Ratio and Output Resolution.",
+            "0", crop_values[0]);
+
+      define_option(def++, "video", OPTION_CROP_V, "Crop Vertical",
+            "Pixels of the captured image removed at the top and at the bottom. "
+            "Applied before Aspect Ratio and Output Resolution.",
+            "0", crop_values[1]);
 
       define_option(def++, "video", OPTION_PACING, "Frame Pacing",
             "The capture device and RetroArch run on separate clocks, so frames sometimes arrive "
@@ -556,8 +618,12 @@ static void declare_core_options(void)
       legacy_variables[8].value = "Frame Pacing; smooth|latest";
       legacy_variables[9].key   = OPTION_STATS_LOG;
       legacy_variables[9].value = "Log Capture Stats; off|on";
-      legacy_variables[10].key   = NULL;
-      legacy_variables[10].value = NULL;
+      legacy_variables[10].key   = OPTION_CROP_H;
+      legacy_variables[10].value = legacy_crop_option(0, "Crop Horizontal");
+      legacy_variables[11].key   = OPTION_CROP_V;
+      legacy_variables[11].value = legacy_crop_option(1, "Crop Vertical");
+      legacy_variables[12].key   = NULL;
+      legacy_variables[12].value = NULL;
       environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, legacy_variables);
    }
 }
@@ -661,6 +727,11 @@ static void read_options(void)
               : option_is(value, "4_3_crop")   ? ASPECT_4_3_CROP
               : option_is(value, "16_9")       ? ASPECT_16_9
               : ASPECT_SOURCE;
+
+   value = get_option(OPTION_CROP_H);
+   opt_crop_h = value ? (unsigned)strtoul(value, NULL, 10) & ~1u : 0;
+   value = get_option(OPTION_CROP_V);
+   opt_crop_v = value ? (unsigned)strtoul(value, NULL, 10) & ~1u : 0;
 
    opt_core_convert = !option_is(get_option(OPTION_CONVERSION), "media_foundation");
 
@@ -781,6 +852,7 @@ static void apply_device_selection(bool force)
    pacing_resync        = false;
    rate_anchor_sequence = 0;
    rate_nominal         = 0.0;
+   rate_candidate       = 0.0;
 
    if (capture_start(devices[index].id, opt_core_convert))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
@@ -866,10 +938,8 @@ static void update_frame_rate(double device_rate)
  * rate is reported instead. With a variable refresh rate display, RetroArch
  * then follows the source exactly.
  *
- * Once the rates match, the moment frames arrive relative to retro_run()
- * stays where it was when the rate changed. The change is therefore made only
- * when frames arrive halfway between two calls, far from the collision zone
- * described in pick_frame().
+ * RetroArch pauses for a moment when the reported rate changes, so a new rate
+ * must be found twice, RATE_CONFIRM_USEC apart, before it is reported.
  */
 static double measure_frame_rate(const capture_frame_t *frame)
 {
@@ -911,28 +981,34 @@ static double measure_frame_rate(const capture_frame_t *frame)
    candidates[1] = rate_nominal * 1000.0 / 1001.0;
    candidates[2] = rate_nominal * 1001.0 / 1000.0;
 
-   /* Wait for frames to arrive halfway between two calls. */
-   {
-      const double age_ms    = (double)(capture_time_usec() - frame->arrival_usec) / 1000.0;
-      const double period_ms = 1000.0 / output_fps;
-
-      if (age_ms < period_ms * 0.3 || age_ms > period_ms * 0.7)
-         return rate_reported;
-   }
-
    for (i = 0; i < 3; i++)
-   {
-      if (candidates[i] != rate_reported && fabs(measured / candidates[i] - 1.0) <= RATE_TOLERANCE)
-      {
-         rate_reported = candidates[i];
-         log_cb(RETRO_LOG_INFO, LOG_PREFIX "Measured frame rate: %.3f fps (device declares %.3f).\n",
-               measured, rate_nominal);
-         stats_log_printf("Measured frame rate: %.3f fps (device declares %.3f), reporting %.3f fps to RetroArch.",
-               measured, rate_nominal, rate_reported);
+      if (fabs(measured / candidates[i] - 1.0) <= RATE_TOLERANCE)
          break;
-      }
+
+   /* No match, or the rate already reported: nothing to change. */
+   if (i == 3 || candidates[i] == rate_reported)
+   {
+      rate_candidate = 0.0;
+      return rate_reported;
    }
 
+   /* A new rate must be found again RATE_CONFIRM_USEC later, over a longer
+    * measurement, before it is reported: each change pauses RetroArch. */
+   if (candidates[i] != rate_candidate)
+   {
+      rate_candidate      = candidates[i];
+      rate_candidate_usec = frame->arrival_usec;
+      return rate_reported;
+   }
+   if (frame->arrival_usec - rate_candidate_usec < RATE_CONFIRM_USEC)
+      return rate_reported;
+
+   rate_reported  = candidates[i];
+   rate_candidate = 0.0;
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "Measured frame rate: %.3f fps (device declares %.3f).\n",
+         measured, rate_nominal);
+   stats_log_printf("Measured frame rate: %.3f fps (device declares %.3f), reporting %.3f fps to RetroArch.",
+         measured, rate_nominal, rate_reported);
    return rate_reported;
 }
 
@@ -1312,18 +1388,35 @@ static enum color_matrix frame_matrix(const capture_frame_t *frame)
 static void output_capture_frame(void)
 {
    capture_frame_t *frame = &last_frame;
-   unsigned crop_x     = 0;
-   unsigned crop_width = frame->width;
+   unsigned crop_x      = 0;
+   unsigned crop_y      = 0;
+   unsigned crop_width  = frame->width;
+   unsigned crop_height = frame->height;
    unsigned dst_width, dst_height;
    uint32_t *out;
    size_t pitch;
    float aspect;
 
-   /* Crop the central 4:3 area when the source is wider than 4:3. */
-   if (opt_aspect == ASPECT_4_3_CROP && frame->width * 3 > frame->height * 4)
+   /* Crop options, ignored if they would leave less than 16 pixels. All
+    * values are even: YUV pixels come in pairs. */
+   if (opt_crop_h && frame->width > opt_crop_h * 2 + 16)
    {
-      crop_width = (frame->height * 4 + 1) / 3;
-      crop_x     = ((frame->width - crop_width) / 2) & ~1u; /* Even: YUV pixels come in pairs */
+      crop_x     = opt_crop_h;
+      crop_width = frame->width - opt_crop_h * 2;
+   }
+   if (opt_crop_v && frame->height > opt_crop_v * 2 + 16)
+   {
+      crop_y      = opt_crop_v;
+      crop_height = frame->height - opt_crop_v * 2;
+   }
+
+   /* Keep the central 4:3 area when the remaining area is wider than 4:3. */
+   if (opt_aspect == ASPECT_4_3_CROP && crop_width * 3 > crop_height * 4)
+   {
+      const unsigned width = ((crop_height * 4 + 1) / 3) & ~1u;
+
+      crop_x    += ((crop_width - width) / 2) & ~1u;
+      crop_width = width;
    }
 
    switch (opt_aspect)
@@ -1331,13 +1424,13 @@ static void output_capture_frame(void)
       case ASPECT_4_3_SQUASH:
       case ASPECT_4_3_CROP: aspect = 4.0f / 3.0f; break;
       case ASPECT_16_9:     aspect = 16.0f / 9.0f; break;
-      default:              aspect = (float)crop_width / (float)frame->height; break;
+      default:              aspect = (float)crop_width / (float)crop_height; break;
    }
 
    if (opt_resolution == RESOLUTION_NATIVE)
    {
       dst_width  = crop_width;
-      dst_height = frame->height;
+      dst_height = crop_height;
    }
    else
    {
@@ -1348,8 +1441,8 @@ static void output_capture_frame(void)
    if (frame->format == CAPTURE_FORMAT_XRGB8888 && opt_resolution == RESOLUTION_NATIVE)
    {
       /* No copy: point into the captured frame. The pitch skips the cropped
-       * columns, so the frontend reads only the central area. */
-      out   = (uint32_t *)frame->data + crop_x;
+       * columns, so the frontend reads only the crop area. */
+      out   = (uint32_t *)(frame->data + frame->stride * crop_y) + crop_x;
       pitch = frame->stride;
    }
    else
@@ -1361,14 +1454,14 @@ static void output_capture_frame(void)
 
       if (frame->format == CAPTURE_FORMAT_XRGB8888)
       {
-         if (!scale_area((const uint32_t *)frame->data, (unsigned)(frame->stride / 4), crop_x, 0,
-               crop_width, frame->height, out, dst_width, dst_height))
+         if (!scale_area((const uint32_t *)frame->data, (unsigned)(frame->stride / 4), crop_x, crop_y,
+               crop_width, crop_height, out, dst_width, dst_height))
             return; /* Cannot happen with CAPTURE_MAX_* sizes; keep the previous frame */
       }
       else
       {
          convert_set_colorimetry(frame_matrix(frame), opt_color_range);
-         if (!convert_yuv_frame(frame, crop_x, crop_width, out, dst_width, dst_height))
+         if (!convert_yuv_frame(frame, crop_x, crop_y, crop_width, crop_height, out, dst_width, dst_height))
             return;
       }
    }

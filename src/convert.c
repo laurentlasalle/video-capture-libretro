@@ -100,18 +100,18 @@ static inline uint32_t yuv_to_xrgb(uint32_t y, uint32_t u, uint32_t v)
 /* ------------------------------------------------------------------------ */
 
 /* Both formats share one U and V pair between two horizontal pixels, so the
- * chroma contributions are computed once per pair. crop_x and crop_width are
- * even. */
-static void convert_native(const capture_frame_t *frame, unsigned crop_x, unsigned crop_width, uint32_t *dst)
+ * chroma contributions are computed once per pair. `luma` and `chroma_plane`
+ * point to the first row of the crop area; crop_x and crop_width are even. */
+static void convert_native(const capture_frame_t *frame, const uint8_t *luma, const uint8_t *chroma_plane,
+      unsigned crop_x, unsigned crop_width, unsigned height, uint32_t *dst)
 {
    const bool nv12 = frame->format == CAPTURE_FORMAT_NV12;
-   const uint8_t *chroma_plane = frame->data + frame->stride * frame->height;
    unsigned x, y;
 
-   for (y = 0; y < frame->height; y++)
+   for (y = 0; y < height; y++)
    {
       uint32_t *out = dst + (size_t)y * crop_width;
-      const uint8_t *row = frame->data + frame->stride * y;
+      const uint8_t *row = luma + frame->stride * y;
       const uint8_t *chroma = nv12 ? chroma_plane + frame->stride * (y / 2) + crop_x : NULL;
 
       if (!nv12)
@@ -226,11 +226,10 @@ static void sum_rows(uint32_t *sums, const uint8_t *plane, size_t stride, size_t
  * Y, U and V are averaged separately, then converted to RGB. In both formats,
  * one U and V pair covers 2 pixels horizontally (and 2 rows in NV12).
  */
-static void convert_resampled(const capture_frame_t *frame, unsigned crop_x, unsigned crop_width,
-      uint32_t *dst, unsigned dst_width, unsigned dst_height)
+static void convert_resampled(const capture_frame_t *frame, const uint8_t *luma, const uint8_t *chroma_plane,
+      unsigned crop_x, unsigned crop_width, unsigned height, uint32_t *dst, unsigned dst_width, unsigned dst_height)
 {
    const bool nv12 = frame->format == CAPTURE_FORMAT_NV12;
-   const uint8_t *chroma_plane = frame->data + frame->stride * frame->height;
    unsigned x, y, i;
 
    if (!reciprocal[1])
@@ -238,7 +237,7 @@ static void convert_resampled(const capture_frame_t *frame, unsigned crop_x, uns
          reciprocal[i] = (65536 + i / 2) / i;
 
    compute_spans(col_start, col_end, crop_width, dst_width);
-   compute_spans(row_start, row_end, frame->height, dst_height);
+   compute_spans(row_start, row_end, height, dst_height);
 
    for (y = 0; y < dst_height; y++)
    {
@@ -252,7 +251,7 @@ static void convert_resampled(const capture_frame_t *frame, unsigned crop_x, uns
          const unsigned chroma_last  = (row_end[y] + 1) / 2;
          const unsigned chroma_rows  = chroma_last - chroma_first;
 
-         sum_rows(luma_sums, frame->data, frame->stride, crop_x, crop_width, row_start[y], row_end[y]);
+         sum_rows(luma_sums, luma, frame->stride, crop_x, crop_width, row_start[y], row_end[y]);
          sum_rows(chroma_sums, chroma_plane, frame->stride, crop_x, crop_width, chroma_first, chroma_last);
 
          for (x = 0; x < dst_width; x++)
@@ -278,7 +277,7 @@ static void convert_resampled(const capture_frame_t *frame, unsigned crop_x, uns
       }
       else /* YUY2: Y0 U Y1 V, so Y at even bytes, U at 4n + 1, V at 4n + 3 */
       {
-         sum_rows(luma_sums, frame->data, frame->stride, (size_t)crop_x * 2, crop_width * 2,
+         sum_rows(luma_sums, luma, frame->stride, (size_t)crop_x * 2, crop_width * 2,
                row_start[y], row_end[y]);
 
          for (x = 0; x < dst_width; x++)
@@ -304,21 +303,29 @@ static void convert_resampled(const capture_frame_t *frame, unsigned crop_x, uns
    }
 }
 
-bool convert_yuv_frame(const capture_frame_t *frame, unsigned crop_x, unsigned crop_width,
-      uint32_t *dst, unsigned dst_width, unsigned dst_height)
+bool convert_yuv_frame(const capture_frame_t *frame, unsigned crop_x, unsigned crop_y,
+      unsigned crop_width, unsigned crop_height, uint32_t *dst, unsigned dst_width, unsigned dst_height)
 {
+   const uint8_t *luma, *chroma_plane;
+
    if ((frame->format != CAPTURE_FORMAT_NV12 && frame->format != CAPTURE_FORMAT_YUY2) ||
-       !crop_width || !frame->height || (crop_x | crop_width) & 1 || crop_x + crop_width > frame->width ||
+       !crop_width || !crop_height || (crop_x | crop_y | crop_width) & 1 ||
+       crop_x + crop_width > frame->width || crop_y + crop_height > frame->height ||
        !dst_width || !dst_height || dst_width > CAPTURE_MAX_WIDTH || dst_height > CAPTURE_MAX_HEIGHT)
       return false;
 
    if (!tables_ready)
       convert_set_colorimetry(COLOR_MATRIX_REC709, COLOR_RANGE_LIMITED);
 
-   if (dst_width == crop_width && dst_height == frame->height)
-      convert_native(frame, crop_x, crop_width, dst);
+   /* First row of the crop area. NV12 chroma rows cover 2 luma rows each,
+    * hence the even crop_y. */
+   luma         = frame->data + frame->stride * crop_y;
+   chroma_plane = frame->data + frame->stride * frame->height + frame->stride * (crop_y / 2);
+
+   if (dst_width == crop_width && dst_height == crop_height)
+      convert_native(frame, luma, chroma_plane, crop_x, crop_width, crop_height, dst);
    else
-      convert_resampled(frame, crop_x, crop_width, dst, dst_width, dst_height);
+      convert_resampled(frame, luma, chroma_plane, crop_x, crop_width, crop_height, dst, dst_width, dst_height);
 
    return true;
 }

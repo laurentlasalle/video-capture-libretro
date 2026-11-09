@@ -21,13 +21,15 @@ Close OBS or any other application using the device first: most capture devices 
 
 ## Core options
 
-**Capture Device** is on the main page of **Quick Menu > Core Options**; the other options are grouped in three submenus: **Video** (Output Resolution, Aspect Ratio, Frame Pacing), **Color** (Color Conversion, Color Space, Color Range) and **Diagnostics** (Show Capture Stats, Log Capture Stats, No Signal Details).
+**Capture Device** is on the main page of **Quick Menu > Core Options**; the other options are grouped in three submenus: **Video** (Output Resolution, Aspect Ratio, Crop Horizontal, Crop Vertical, Frame Pacing), **Color** (Color Conversion, Color Space, Color Range) and **Diagnostics** (Show Capture Stats, Log Capture Stats, No Signal Details).
 
 | Option | Values | Description |
 |--------|--------|-------------|
 | Capture Device | Auto, detected devices | Device to display. Auto selects the first device found. Devices are detected when the core starts. |
 | Output Resolution | Native, 640x480, 320x240 | Size of the image passed to the shaders. CRT and VHS shaders expect a low resolution. Downscaling averages the source pixels to avoid aliasing. |
-| Aspect Ratio | Source, 4:3 (Squash), 4:3 (Crop Pillarbox), 16:9 | Display aspect ratio. *Squash* keeps the whole frame, for a 4:3 picture stretched to 16:9. *Crop Pillarbox* keeps only the central 4:3 area, for a picture with black bars on the sides. |
+| Aspect Ratio | Source, 4:3 (Squash), 4:3 (Crop Pillarbox), 16:9 | Display aspect ratio. *Squash* keeps the whole frame, for a 4:3 picture stretched to 16:9. *Crop Pillarbox* keeps only the central 4:3 area, for a picture with black bars on the sides. Applies to the area left by the crop options. |
+| Crop Horizontal | Off, 4 to 504 px | Pixels removed on the left and on the right of the captured image, for example the black borders around a pixel-perfect picture. Applied before Aspect Ratio and Output Resolution. |
+| Crop Vertical | Off, 2 to 252 px | Pixels removed at the top and at the bottom. |
 | Frame Pacing | Smooth, Lowest Latency | *Smooth* (the default) shows every frame in order; when frames arrive right when RetroArch asks for one, it adds up to one frame of latency, then skips a single frame to catch up. Recommended to watch video. *Lowest Latency* always shows the newest frame, but drops and repeats frames at those moments. Recommended to play games through the capture device. See [Latency and frame pacing](#latency-and-frame-pacing). |
 | Color Conversion | Core, Media Foundation | Who converts the device's YUV picture to RGB. *Core* converts after downscaling, which is faster at 640x480 and 320x240, and applies the two options below. *Media Foundation* converts the full frame with Windows. |
 | Color Space | Default, Rec. 709, Rec. 601 | Shown when Color Conversion is set to Core. Color matrix for the conversion. *Default* uses Rec. 601 up to 576 lines and Rec. 709 above. |
@@ -62,7 +64,7 @@ Next time the file is loaded, its options and shader preset come back automatica
 ## Latency and frame pacing
 
 - With **Frame Pacing** set to **Lowest Latency**, each `retro_run()` shows the most recent frame received; there is no frame queue.
-- The core reports the device's frame rate to RetroArch, so RetroArch paces the core on the capture device. Many devices declare 60 fps even when the source runs at 59.94 fps (NTSC video): the core measures the real rate over the first seconds and, if it differs, reports the measured rate instead. The change is noted in the stats log.
+- The core reports the device's frame rate to RetroArch, so RetroArch paces the core on the capture device. The rate a device declares is not always the rate of the signal: a device can declare 60 fps for a 59.94 fps source (NTSC video), or the reverse. The core measures the real rate over the first seconds and, if it differs, reports the measured rate instead; it is confirmed by a second measurement 5 seconds later. The change is noted in the stats log. With **Color Conversion** set to **Media Foundation**, the core also turns off the frame rate conversion of Windows' video processor, which would otherwise drop or repeat frames to match the declared rate.
 
 The display's refresh rate decides whether every captured frame is shown. Capture devices usually run at 59.94 fps, which no fixed refresh rate divides evenly: at 120 Hz with **VSync Swap Interval** set to 2, RetroArch shows exactly 60 fps and has to skip a frame regularly to stay in sync; without VSync, RetroArch's timing is uneven and many frames are lost. In order of preference:
 
@@ -74,7 +76,7 @@ The moment a frame arrives, relative to the moment RetroArch asks for one, is se
 - With **Smooth** (the default), the core shows the frames in order, with at most one frame of extra latency at those moments, then skips a single frame to catch up.
 - With **Lowest Latency**, frames are dropped and repeated for as long as the two stay close: a few seconds when the rates differ slightly, possibly a minute or more when they match exactly.
 
-When the core switches to a measured frame rate, it does so when frames arrive halfway between two calls, so that they stay away from that point. RetroArch pauses for a moment when the frame rate changes; this happens once, about 10 seconds after the device opens.
+Where frames land relative to RetroArch's calls is set by chance when the device opens, and again when the reported frame rate changes, since RetroArch pauses for a moment then (about 15 seconds after the device opens, if the measured rate differs). With **Lowest Latency**, it can land close to that point and stay there, with frames dropped and repeated every second or so; reopening the device (for example by switching **Color Conversion** back and forth) draws it again. **Smooth** does not have this problem.
 
 Turn on **Show Capture Stats** to check: the *Output* rate should match the *Capture* rate. With **Log Capture Stats**, the rates, the frames dropped and repeated, and the age of each frame when shown are written every second to `video_capture_stats.log`, followed by a session summary when the core closes. The options in use are listed at the top of the file, and each change is noted with the second it happened. Pauses (RetroArch's menu), stalls (RetroArch rebuilding a shader, for example when the output size changes) and the startup delay are noted in the file and excluded from the measurements; frames lost in the partial second before them are written on a separate line, so the lines add up to the session summary. RetroArch 1.16 does not keep core messages in its own log once content is running, hence the separate file.
 
