@@ -1,4 +1,4 @@
-First release of **Video Capture Device**, a libretro core that shows a live video capture device (capture card, HDMI grabber, webcam) in RetroArch, so its shaders can be applied to a VCR, original console hardware, or anything else plugged into a capture card.
+First release of **Video Capture Device**, a libretro core that shows a live video capture device (capture card, HDMI grabber, webcam) in RetroArch, so its shaders can be applied to original console hardware, a VCR, or anything else plugged into a capture card.
 
 ## Features
 

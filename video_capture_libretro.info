@@ -34,4 +34,4 @@ is_experimental = "false"
 firmware_count = 0
 notes = "(!) Windows only: video through Media Foundation, audio through WASAPI.|(!) Close OBS or any other application using the capture device first.|[1] Start it with Start Core, or load an empty .vidcap file to save core options and shader presets per source (one file per console or VCR).|[2] The capture device and audio input are picked in the core options."
 
-description = "Displays a live video capture device (capture card, HDMI grabber, webcam) so RetroArch shaders can be applied to external sources such as a VCR or original console hardware. It downscales and crops the picture before the shaders, converts YUV to RGB, measures the source's real frame rate, and plays the device's audio in sync. There is no emulation here: the core passes the capture device's frames and sound to the frontend."
+description = "Displays a live video capture device (capture card, HDMI grabber) so RetroArch shaders can be applied to external sources such as original console hardware or a VCR."

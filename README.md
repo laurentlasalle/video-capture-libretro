@@ -1,6 +1,6 @@
 # video-capture-libretro
 
-A [libretro](https://www.libretro.com/) core that displays a live video capture device (capture card, HDMI grabber, webcam) inside RetroArch, so its shaders can be applied to external sources: a VCR, original console hardware, or anything else plugged into a capture card.
+A [libretro](https://www.libretro.com/) core that displays a live video capture device (capture card, HDMI grabber, webcam) inside RetroArch, so its shaders can be applied to external sources: original console hardware, a VCR, or anything else plugged into a capture card.
 
 It works like OBS Studio's *Video Capture Device* source, but the image goes through RetroArch's shader pipeline instead.
 
