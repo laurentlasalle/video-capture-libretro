@@ -10,6 +10,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#ifndef NOMINMAX
+#define NOMINMAX /* windows.h would otherwise define min() and max() macros */
+#endif
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
