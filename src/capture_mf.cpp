@@ -6,8 +6,9 @@
  * as is (NV12 or YUY2, converted to RGB by the core after downscaling) or
  * converted to RGB32 by the source reader's video processor.
  *
- * Each received frame is copied once, into a triple buffer; the core picks up
- * the most recent one in retro_run() by swapping pointers.
+ * Each received frame is copied once, into a ring of recent frames (see
+ * frame_slot). The core picks the frame to show in retro_run() and reads it in
+ * place, without another copy.
  *
  * Copyright (c) 2026 Laurent LaSalle
  * SPDX-License-Identifier: MIT
@@ -349,10 +350,8 @@ static void copy_plane(uint8_t *dst, const BYTE *src, LONG pitch, size_t row_byt
          memcpy(dst + y * row_bytes, src + (ptrdiff_t)y * pitch, row_bytes);
 }
 
-/* Copies a locked image into the write slot, then publishes it.
- * `buffer_len` is the size of the locked buffer, used to find the NV12 chroma
- * plane when the driver pads the luma plane. */
-/* Microseconds from the high-resolution performance counter. */
+/* Microseconds from the high-resolution performance counter, the clock used
+ * for frame arrival times. The split avoids overflowing 64 bits. */
 static int64_t qpc_usec(void)
 {
    static LARGE_INTEGER frequency;
@@ -365,6 +364,9 @@ static int64_t qpc_usec(void)
          now.QuadPart % frequency.QuadPart * 1000000 / frequency.QuadPart);
 }
 
+/* Copies a locked image into the write slot, then publishes it.
+ * `buffer_len` is the size of the locked buffer, used to find the NV12 chroma
+ * plane when the driver pads the luma plane. */
 static void copy_to_write_slot(const BYTE *scan0, LONG pitch, size_t buffer_len,
       enum capture_format format, unsigned width, unsigned height, int64_t arrival_usec)
 {
@@ -706,6 +708,7 @@ static void log_native_formats(IMFSourceReader *reader)
 }
 
 /* Picks the device's native format to request. Preference order:
+ * 0. the preferred height, if any (Capture Resolution option),
  * 1. at most 1920x1080 (4K is unnecessary for low-resolution shaders),
  * 2. highest frame rate,
  * 3. largest frame size,
@@ -745,9 +748,9 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv, u
       if (!best)                        better = true;
       else if (matches != best_matches) better = matches;
       else if (fits != best_fits)       better = fits;
-      else if (fps != best_fps)   better = fps > best_fps;
-      else if (area != best_area) better = area > best_area;
-      else                        better = rank > best_rank;
+      else if (fps != best_fps)         better = fps > best_fps;
+      else if (area != best_area)       better = area > best_area;
+      else                              better = rank > best_rank;
 
       if (better)
       {
@@ -755,9 +758,9 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv, u
          best         = type;
          best_matches = matches;
          best_fits    = fits;
-         best_fps  = fps;
-         best_area = area;
-         best_rank = rank;
+         best_fps     = fps;
+         best_area    = area;
+         best_rank    = rank;
       }
       else
          safe_release(&type);

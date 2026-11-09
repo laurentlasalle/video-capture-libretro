@@ -17,31 +17,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <math.h>
 
 #include "libretro.h"
-#include "capture.h"
 #include "audio.h"
+#include "audio_output.h"
+#include "capture.h"
 #include "convert.h"
+#include "core.h"
 #include "font.h"
+#include "no_signal.h"
+#include "options.h"
 #include "scale.h"
 
-#ifndef CORE_VERSION
-#define CORE_VERSION "0.0.0"
-#endif
-
-#define CORE_NAME  "Video Capture Device"
-#define LOG_PREFIX "[Video Capture Device] "
-
-#define SCREEN_WIDTH  640 /* No Signal screen size */
-#define SCREEN_HEIGHT 480
-#define DEFAULT_FPS   60.0
-#define SAMPLE_RATE   48000.0
-#define AUDIO_FRAMES_MAX 4800 /* Silence buffer: enough for frame rates down to 10 fps */
+/* ------------------------------------------------------------------------ */
+/* Constants                                                                 */
+/* ------------------------------------------------------------------------ */
 
 /* Seconds without frames before showing the No Signal screen. */
 #define NO_FRAMES_TIMEOUT 2.0
@@ -51,8 +45,6 @@
  * No Signal screen. Avoids switching to the No Signal screen's size and back,
  * which makes RetroArch rebuild its shaders twice. */
 #define REOPEN_HOLD       1.0
-/* Seconds between attempts to reopen a device that failed. */
-#define RETRY_INTERVAL    3.0
 
 /* Smooth frame pacing (see pick_frame()). A frame arriving within this many
  * milliseconds of retro_run() is in the "collision zone", where timing noise
@@ -61,188 +53,78 @@
 /* retro_run() calls outside the collision zone before catching up one frame. */
 #define PACING_SKIP_RUNS  30
 
-/* ------------------------------------------------------------------------ */
-/* Core options                                                              */
-/* ------------------------------------------------------------------------ */
+/* Pause detection (see detect_pause()). RetroArch stops calling retro_run()
+ * while its menu is open, and briefly while it rebuilds a shader (for example
+ * when the output size changes). A gap of STALL_THRESHOLD_USEC or more is
+ * excluded from the stats; from PAUSE_THRESHOLD_USEC, it is logged as a pause
+ * rather than a stall. */
+#define STALL_THRESHOLD_USEC 100000
+#define PAUSE_THRESHOLD_USEC 500000
 
-#define OPTION_DEVICE      "video_capture_device"
-#define OPTION_RESOLUTION  "video_capture_resolution"
-#define OPTION_ASPECT      "video_capture_aspect"
-#define OPTION_CONVERSION  "video_capture_conversion"
-#define OPTION_COLOR_SPACE "video_capture_color_space"
-#define OPTION_COLOR_RANGE "video_capture_color_range"
-#define OPTION_STATS       "video_capture_stats"
-#define OPTION_DETAILS     "video_capture_no_signal_details"
-#define OPTION_PACING      "video_capture_frame_pacing"
-#define OPTION_STATS_LOG   "video_capture_stats_log"
-#define OPTION_CROP_H      "video_capture_crop_horizontal"
-#define OPTION_CAPTURE_RES "video_capture_capture_resolution"
-#define OPTION_AUDIO       "video_capture_audio_device"
-#define AUDIO_OFF          "off"
-#define AUDIO_AUTO         "auto"
-#define OPTION_CROP_V      "video_capture_crop_vertical"
+/* Frame rate measurement (see measure_frame_rate()). */
+#define RATE_MIN_USEC     10000000 /* Measure over at least 10 seconds */
+#define RATE_GAP_USEC     500000   /* A longer interval between two device frames restarts the measurement */
+#define RATE_TOLERANCE    0.0004   /* Relative difference accepted between measured and candidate rates */
+#define RATE_CONFIRM_USEC 5000000  /* A new rate must still match 5 seconds later */
 
-/* Crop options: pixels removed on each side. Horizontal steps are larger to
- * fit RetroArch's limit of 128 values per option (127 plus the terminator). */
-#define CROP_VALUES   127
-#define CROP_H_STEP   4   /* 0 to 504 */
-#define CROP_V_STEP   2   /* 0 to 252; even, as NV12 rows come in pairs */
-#define DEVICE_AUTO        "auto"
-
-enum output_resolution
-{
-   RESOLUTION_NATIVE = 0,
-   RESOLUTION_640X480,
-   RESOLUTION_320X240
-};
-
-enum aspect_mode
-{
-   ASPECT_SOURCE = 0,  /* Display aspect follows the signal (16:9 for 1080p) */
-   ASPECT_4_3_SQUASH,  /* Full frame, displayed as 4:3 */
-   ASPECT_4_3_CROP,    /* Central 4:3 area only, pillarbox removed */
-   ASPECT_16_9         /* Full frame, displayed as 16:9 */
-};
-
-enum color_space_option
-{
-   COLOR_SPACE_DEFAULT = 0, /* Rec. 601 up to 576 lines, Rec. 709 above */
-   COLOR_SPACE_REC709,
-   COLOR_SPACE_REC601
-};
-
-enum stats_mode
-{
-   STATS_OFF = 0,
-   STATS_NOTIFICATION, /* RetroArch on-screen notification */
-   STATS_IMAGE         /* Drawn into the image, before shaders */
-};
-
-/* Current option values */
-static enum output_resolution  opt_resolution  = RESOLUTION_NATIVE;
-static enum aspect_mode        opt_aspect      = ASPECT_SOURCE;
-static unsigned                opt_capture_height; /* Preferred device format height, 0 for Auto */
-static unsigned                opt_crop_h;      /* Pixels removed on the left and on the right */
-static unsigned                opt_crop_v;      /* Pixels removed at the top and at the bottom */
-static unsigned                crop_size_width;  /* Captured size the crop values apply to, 0 if unknown */
-static unsigned                crop_size_height;
-static bool                    opt_core_convert = true;
-static enum color_space_option opt_color_space = COLOR_SPACE_DEFAULT;
-static enum color_range        opt_color_range = COLOR_RANGE_LIMITED;
-static enum stats_mode         opt_stats       = STATS_OFF;
-static bool                    opt_details     = false;
-static bool                    opt_smooth_pacing = true;
-static bool                    opt_stats_log   = false;
+/* Stats text colors: as expected, slightly off, or frames are being lost. */
+#define STATS_COLOR_GOOD    0x40FF40
+#define STATS_COLOR_NEUTRAL 0xFFFFFF
+#define STATS_COLOR_BAD     0xFF4040
+#define STATS_LINES         3
 
 /* ------------------------------------------------------------------------ */
 /* State                                                                     */
 /* ------------------------------------------------------------------------ */
 
-/* Frontend callbacks */
-static retro_environment_t        environ_cb;
+/* Frontend callbacks (environ_cb and log_cb are shared through core.h). */
+retro_environment_t               environ_cb;
+retro_log_printf_t                log_cb;
 static retro_video_refresh_t      video_cb;
 static retro_audio_sample_t       audio_cb;
-static retro_audio_sample_batch_t audio_batch_cb;
 static retro_input_poll_t         input_poll_cb;
 static retro_input_state_t        input_state_cb;
-static retro_log_printf_t         log_cb;
 static struct retro_perf_callback perf_cb;
 static unsigned                   message_interface_version;
-static bool                       can_dupe;
+static bool                       can_dupe; /* The frontend accepts NULL to repeat the last image */
 
-/* Devices */
-static capture_device_t devices[CAPTURE_MAX_DEVICES];
-static int              device_count;
-static char             active_device_id[sizeof(devices[0].id)];
-static const char      *active_device_name = "";
-static bool             active_core_convert; /* Conversion mode the device was opened with */
-static unsigned         active_capture_height; /* Preferred format height the device was opened with */
-static double           retry_timer;         /* Seconds until the next reopen attempt */
+/* Open capture device (the list of devices is in options.c). */
+static char        active_device_id[sizeof(devices[0].id)]; /* Empty when no device is open */
+static const char *active_device_name = "";
+static bool        active_core_convert;   /* Color Conversion the device was opened with */
+static unsigned    active_capture_height; /* Capture Resolution the device was opened with */
+static double      retry_timer;           /* Seconds until the next reopen attempt */
 
-/* Why the No Signal screen is shown, if it is. */
-enum signal_state
-{
-   SIGNAL_OK = 0,
-   SIGNAL_NO_DEVICE,   /* No capture device found */
-   SIGNAL_DEVICE_ERROR,/* The device could not be opened, or stopped with an error */
-   SIGNAL_NO_FRAMES,   /* The device is open but sends no frames */
-   SIGNAL_BLACK,       /* The device sends uniformly black frames: no input signal */
-   SIGNAL_HOLD         /* The device just reopened: keep the last image until its first frame */
-};
-
-/* Capture */
-static capture_frame_t last_frame;     /* Last frame received; valid while have_frame */
+/* Frames from the device */
+static capture_frame_t last_frame;     /* Last frame picked; valid while have_frame */
 static bool            have_frame;
 static double          seconds_without_frame;
-static double          seconds_black;
-static bool            showing_capture; /* The last image sent is a captured frame */
+static double          seconds_black;  /* Uniformly black frames for this long */
 
-/* Output */
+/* Output to the frontend */
 static uint32_t       *rgb_buffer;      /* Converted or scaled image */
 static size_t          rgb_buffer_size; /* In pixels */
-static uint32_t        screen_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
-static char            screen_key[1024]; /* Content of the No Signal screen last drawn */
 static const uint32_t *last_output;
 static size_t          last_output_pitch;
-static unsigned        output_width  = SCREEN_WIDTH;
-static unsigned        output_height = SCREEN_HEIGHT;
+static bool            showing_capture; /* The last image sent is a captured frame, not the No Signal screen */
+static unsigned        output_width  = NO_SIGNAL_WIDTH;
+static unsigned        output_height = NO_SIGNAL_HEIGHT;
 static float           output_aspect = 4.0f / 3.0f;
 static double          output_fps    = DEFAULT_FPS;
+static unsigned        crop_size_width;  /* Captured size the crop values apply to, 0 if unknown */
+static unsigned        crop_size_height;
 
-/* Audio */
-static int16_t silence[AUDIO_FRAMES_MAX * 2];
-static double  audio_frames_pending; /* Fractional audio frames carried between video frames */
+/* Frame pacing (see pick_frame()) */
+static uint64_t shown_sequence;   /* Sequence of the frame shown last, 0 if none */
+static unsigned pacing_safe_runs; /* Consecutive runs behind, outside the collision zone */
+static bool     pacing_resync;    /* Show the newest frame next, without counting drops */
 
-/* Audio capture (see output_audio()). */
-#define AUDIO_TARGET_FRAMES 1600   /* Buffered input kept ahead of the output: about 33 ms at 48 kHz */
-#define AUDIO_MAX_ADJUST    0.005  /* Largest resampling correction, +/- 0.5% (inaudible) */
-static char     active_audio_id[sizeof(((audio_device_t *)0)->id)];
-static double   audio_retry_timer;
-static bool     audio_buffering = true; /* Waiting for AUDIO_TARGET_FRAMES before playing */
-static double   audio_in_pending;       /* Fractional input frames carried between video frames */
-static int16_t  audio_in[AUDIO_FRAMES_MAX * 4 * 2];
-static int16_t  audio_out[AUDIO_FRAMES_MAX * 2];
-static uint64_t session_audio_underruns;
-static uint64_t session_audio_resyncs;
-
-/* Stats */
-static retro_time_t stats_last_time;
-static uint64_t     stats_last_received;
-static uint64_t     stats_frames_shown;  /* New frames shown since stats_last_time */
-static uint64_t     stats_runs;          /* retro_run() calls since stats_last_time */
-static uint64_t     stats_dropped;       /* Frames skipped (never shown) since stats_last_time */
-static uint64_t     stats_repeated;      /* Calls that repeated the previous frame */
-static double       stats_capture_fps;   /* Frames received from the device per second */
-static double       stats_frontend_fps;  /* retro_run() calls per second */
-static double       stats_output_fps;    /* New frames shown per second */
-
-/* Session totals since the device was opened, logged when it is closed. */
-static retro_time_t session_start_time;
-static uint64_t     session_frames_shown;
-static uint64_t     session_runs;
-static uint64_t     session_dropped;
-static uint64_t     session_pacing_skips;
-static uint64_t     session_repeated;
-static retro_time_t session_paused_usec;   /* Time RetroArch did not run the core (menu) */
-static uint64_t     session_paused_frames; /* Frames received during those pauses */
-
-/* Pause detection: RetroArch stops calling retro_run() while its menu is
- * open, and briefly while it rebuilds a shader (for example when the output
- * size changes). Frames missed meanwhile are not counted as drops. A gap of
- * STALL_THRESHOLD_USEC or more is excluded from the stats; from
- * PAUSE_THRESHOLD_USEC, it is logged as a pause rather than a stall. */
-#define STALL_THRESHOLD_USEC 100000
-#define PAUSE_THRESHOLD_USEC 500000
-static retro_time_t last_run_usec;
-static uint64_t     last_run_received;
-static bool         pacing_resync;    /* Show the newest frame next, without counting drops */
+/* Pause detection (see detect_pause()) */
+static retro_time_t last_run_usec;     /* Time of the last retro_run() */
+static uint64_t     last_run_received; /* Frames received from the device at that time */
 static bool         waiting_first_run; /* Device opened, retro_run() not called since */
 
-/* Frame rate measurement (see measure_frame_rate()). */
-#define RATE_MIN_USEC   10000000 /* Measure over at least 10 seconds */
-#define RATE_GAP_USEC   500000   /* A longer interval between two device frames restarts the measurement */
-#define RATE_TOLERANCE  0.0004   /* Relative difference accepted between measured and reported rates */
-#define RATE_CONFIRM_USEC 5000000 /* A new rate must still match 5 seconds later */
+/* Frame rate measurement (see measure_frame_rate()) */
 static uint64_t rate_anchor_sequence; /* First frame of the measurement, 0 if none */
 static int64_t  rate_anchor_usec;
 static uint64_t rate_last_sequence;
@@ -252,50 +134,43 @@ static double   rate_reported;        /* Rate reported to RetroArch */
 static double   rate_candidate;       /* Rate found by the measurement, not confirmed yet */
 static int64_t  rate_candidate_usec;  /* Arrival time of the frame that found it */
 
-
-/* Age of each frame when shown (time between its arrival from the device and
- * retro_run()), over the current stats second. */
-static double   frame_age_min_ms;
-static double   frame_age_max_ms;
-static double   frame_age_sum_ms;
-static unsigned frame_age_count;
-static unsigned stats_seconds;      /* Seconds since stats started, for the log */
-static uint64_t stats_pacing_skips; /* Frames skipped on purpose by smooth pacing */
-
-/* Frame pacing state */
-static uint64_t shown_sequence;     /* Sequence of the frame shown last, 0 if none */
-static unsigned pacing_safe_runs;   /* Consecutive runs behind, outside the collision zone */
-
-#define STATS_LINES 3
+/* Stats over the current second (see update_stats()) */
+static retro_time_t stats_last_time;     /* Start of the current second, 0 to restart */
+static uint64_t     stats_last_received;
+static uint64_t     stats_frames_shown;  /* New frames shown */
+static uint64_t     stats_runs;          /* retro_run() calls */
+static uint64_t     stats_dropped;       /* Frames never shown */
+static uint64_t     stats_pacing_skips;  /* Of which skipped on purpose by Smooth pacing */
+static uint64_t     stats_repeated;      /* Calls that repeated the previous frame */
+static double       frame_age_min_ms;    /* Age of the frames shown: time from arrival to retro_run() */
+static double       frame_age_max_ms;
+static double       frame_age_sum_ms;
+static unsigned     frame_age_count;
+static unsigned     stats_seconds;       /* Seconds logged since the stats log was opened */
+static double       stats_capture_fps;   /* Results of the last second */
+static double       stats_frontend_fps;
+static double       stats_output_fps;
 static char         stats_lines[STATS_LINES][96];
 static uint32_t     stats_colors[STATS_LINES];
 
-/* Stats colors: as expected, slightly off, or frames are being lost. */
-#define STATS_COLOR_GOOD    0x40FF40
-#define STATS_COLOR_NEUTRAL 0xFFFFFF
-#define STATS_COLOR_BAD     0xFF4040
-
-/* Core option storage. Device names are used as option values. */
-static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
-static struct retro_core_option_v2_definition option_definitions[15];
-static struct retro_core_option_v2_category   option_categories[4];
-static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
-static struct retro_variable legacy_variables[15];
-
-/* Audio inputs, named like the capture devices. */
-static audio_device_t audio_devices[AUDIO_MAX_DEVICES];
-static int            audio_device_count;
-static char           option_audio_names[AUDIO_MAX_DEVICES][sizeof(audio_devices[0].name) + 16];
-static char           legacy_audio_values[AUDIO_MAX_DEVICES * (sizeof(audio_devices[0].name) + 17) + 64];
-
-/* Crop option values and labels, built at startup ("0" / "Off", "4" / "4 px"). */
-static char        crop_text[2][CROP_VALUES][2][12];
-static const char *crop_values[2][CROP_VALUES * 2 + 1];
-static char        legacy_crop_values[2][CROP_VALUES * 5 + 32];
+/* Session totals since the device was opened, logged when it is closed. */
+static retro_time_t session_start_time;
+static uint64_t     session_frames_shown;
+static uint64_t     session_runs;
+static uint64_t     session_dropped;
+static uint64_t     session_pacing_skips;
+static uint64_t     session_repeated;
+static retro_time_t session_paused_usec;   /* Time RetroArch did not run the core (menu, stalls) */
+static uint64_t     session_paused_frames; /* Frames received meanwhile */
 
 /* ------------------------------------------------------------------------ */
 /* Logging                                                                   */
 /* ------------------------------------------------------------------------ */
+
+retro_time_t core_time_usec(void)
+{
+   return perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+}
 
 /* Fallback logger used when the frontend does not provide one. */
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
@@ -313,9 +188,7 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
  * messages in its own log once content is running. */
 static FILE *stats_log_file;
 
-static void log_options(bool all);
-
-static void stats_log_printf(const char *fmt, ...)
+void stats_log_printf(const char *fmt, ...)
 {
    va_list va;
 
@@ -361,7 +234,40 @@ static void update_stats_log_file(void)
    log_cb(stats_log_file ? RETRO_LOG_INFO : RETRO_LOG_WARN, LOG_PREFIX "Capture stats log: %s (%s).\n",
          path, stats_log_file ? "open" : "could not open");
    stats_log_printf("Video Capture Device %s. Options:", CORE_VERSION);
-   log_options(true);
+   options_log(true);
+}
+
+/* Shows `text` on screen for `duration_ms`. A STATUS message is meant to be
+ * refreshed (the stats); a NOTIFICATION is a one-time message. Frontends
+ * older than message interface 1 only know a duration in frames. */
+static void send_message(const char *text, unsigned duration_ms, enum retro_message_type type)
+{
+   if (message_interface_version >= 1)
+   {
+      struct retro_message_ext message;
+
+      message.msg      = text;
+      message.duration = duration_ms;
+      message.priority = 1;
+      message.level    = RETRO_LOG_INFO;
+      message.target   = RETRO_MESSAGE_TARGET_OSD;
+      message.type     = type;
+      message.progress = -1;
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
+   }
+   else
+   {
+      struct retro_message message;
+
+      message.msg    = text;
+      message.frames = (unsigned)(output_fps * duration_ms / 1000.0);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+   }
+}
+
+void show_notification(const char *text, unsigned duration_ms)
+{
+   send_message(text, duration_ms, RETRO_MESSAGE_TYPE_NOTIFICATION);
 }
 
 /* Forwards backend messages to the frontend log. */
@@ -381,485 +287,6 @@ static void capture_logger(enum capture_log_level level, const char *message)
       log_cb(retro_level, LOG_PREFIX "%s\n", message);
 }
 
-/* ------------------------------------------------------------------------ */
-/* Core options                                                              */
-/* ------------------------------------------------------------------------ */
-
-/* Enumerates devices and gives each a unique name usable as an option value. */
-static void refresh_device_list(void)
-{
-   int i, j;
-
-   device_count = capture_list_devices(devices, CAPTURE_MAX_DEVICES);
-
-   /* Option values must be unique; number identical devices ("Name #2"). */
-   for (i = 0; i < device_count; i++)
-   {
-      int duplicates = 0;
-
-      for (j = 0; j < i; j++)
-         if (strcmp(devices[i].name, devices[j].name) == 0)
-            duplicates++;
-
-      if (duplicates)
-         snprintf(option_device_names[i], sizeof(option_device_names[i]), "%.255s #%d",
-               devices[i].name, duplicates + 1);
-      else
-         snprintf(option_device_names[i], sizeof(option_device_names[i]), "%.255s", devices[i].name);
-   }
-
-   log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d capture device(s) found.\n", device_count);
-   for (i = 0; i < device_count; i++)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_device_names[i]);
-
-   audio_device_count = audio_list_devices(audio_devices, AUDIO_MAX_DEVICES);
-   for (i = 0; i < audio_device_count; i++)
-   {
-      int duplicates = 0;
-
-      for (j = 0; j < i; j++)
-         if (strcmp(audio_devices[i].name, audio_devices[j].name) == 0)
-            duplicates++;
-
-      if (duplicates)
-         snprintf(option_audio_names[i], sizeof(option_audio_names[i]), "%.255s #%d",
-               audio_devices[i].name, duplicates + 1);
-      else
-         snprintf(option_audio_names[i], sizeof(option_audio_names[i]), "%.255s", audio_devices[i].name);
-   }
-
-   log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d audio input(s) found.\n", audio_device_count);
-   for (i = 0; i < audio_device_count; i++)
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_audio_names[i]);
-}
-
-/* Fills one option definition. `values` alternates value and label (NULL
- * label: the value is shown) and ends with NULL. */
-static void define_option(struct retro_core_option_v2_definition *def, const char *category,
-      const char *key, const char *desc, const char *info, const char *default_value,
-      const char *const *values)
-{
-   int i;
-
-   def->category_key  = category;
-   def->key           = key;
-   def->desc          = desc;
-   def->info          = info;
-   def->default_value = default_value;
-   for (i = 0; values[i * 2]; i++)
-   {
-      def->values[i].value = values[i * 2];
-      def->values[i].label = values[i * 2 + 1];
-   }
-}
-
-static const char *const resolution_values[] = {
-   "native", "Native", "640x480", NULL, "320x240", NULL, NULL
-};
-static const char *const aspect_values[] = {
-   "source", "Source", "4_3_squash", "4:3 (Squash)", "4_3_crop", "4:3 (Crop Pillarbox)",
-   "16_9", "16:9", NULL
-};
-static const char *const conversion_values[] = {
-   "core", "Core", "media_foundation", "Media Foundation", NULL
-};
-static const char *const capture_res_values[] = {
-   "auto", "Auto (up to 1080p)", "1080", "1080p", "720", "720p", "576", "576p", "480", "480p", NULL
-};
-static const char *const color_space_values[] = {
-   "default", "Default", "rec709", "Rec. 709", "rec601", "Rec. 601", NULL
-};
-static const char *const color_range_values[] = {
-   "limited", "Limited", "full", "Full", NULL
-};
-static const char *const stats_values[] = {
-   "off", "Off", "notification", "On-Screen Notification", "image", "In Image", NULL
-};
-static const char *const details_values[] = {
-   "off", "Off", "on", "On", NULL
-};
-static const char *const pacing_values[] = {
-   "smooth", "Smooth", "latest", "Lowest Latency", NULL
-};
-static const char *const stats_log_values[] = {
-   "off", "Off", "on", "On", NULL
-};
-
-static bool update_option_visibility(void);
-
-/* Fills crop_values[axis] with CROP_VALUES values, `step` pixels apart. */
-static void build_crop_values(int axis, unsigned step)
-{
-   int i;
-
-   for (i = 0; i < CROP_VALUES; i++)
-   {
-      snprintf(crop_text[axis][i][0], sizeof(crop_text[axis][i][0]), "%u", i * step);
-      if (i == 0)
-         snprintf(crop_text[axis][i][1], sizeof(crop_text[axis][i][1]), "Off");
-      else
-         snprintf(crop_text[axis][i][1], sizeof(crop_text[axis][i][1]), "%u px", i * step);
-      crop_values[axis][i * 2]     = crop_text[axis][i][0];
-      crop_values[axis][i * 2 + 1] = crop_text[axis][i][1];
-   }
-   crop_values[axis][CROP_VALUES * 2] = NULL;
-}
-
-/* Legacy format of the crop values: "Description; 0|4|8|...". */
-static const char *legacy_crop_option(int axis, const char *desc)
-{
-   char *out  = legacy_crop_values[axis];
-   size_t len = (size_t)snprintf(out, sizeof(legacy_crop_values[axis]), "%s; ", desc);
-   int i;
-
-   for (i = 0; i < CROP_VALUES && len < sizeof(legacy_crop_values[axis]); i++)
-      len += (size_t)snprintf(out + len, sizeof(legacy_crop_values[axis]) - len, i ? "|%s" : "%s",
-            crop_text[axis][i][0]);
-   return out;
-}
-
-static void declare_core_options(void)
-{
-   unsigned version = 0;
-   int i;
-
-   build_crop_values(0, CROP_H_STEP);
-   build_crop_values(1, CROP_V_STEP);
-
-   if (!environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &version))
-      version = 0;
-
-   if (version >= 2)
-   {
-      struct retro_core_options_v2 options;
-      struct retro_core_option_v2_definition *def = option_definitions;
-      const int max_devices = RETRO_NUM_CORE_OPTION_VALUES_MAX - 2;
-
-      memset(option_definitions, 0, sizeof(option_definitions));
-      memset(option_categories, 0, sizeof(option_categories));
-
-      /* Capture Device stays on the main page; the other options are grouped
-       * in submenus. */
-      option_categories[0].key  = "video";
-      option_categories[0].desc = "Video";
-      option_categories[0].info = "Output resolution, aspect ratio, crop and frame pacing.";
-      option_categories[1].key  = "color";
-      option_categories[1].desc = "Color";
-      option_categories[1].info = "Conversion of the device's YUV picture to RGB.";
-      option_categories[2].key  = "diagnostics";
-      option_categories[2].desc = "Diagnostics";
-      option_categories[2].info = "Capture stats and No Signal screen details.";
-
-      def->key  = OPTION_DEVICE;
-      def->desc = "Capture Device";
-      def->info = "Video capture device to display. Auto selects the first device found. "
-                  "Devices are detected when the core starts.";
-      def->values[0].value = DEVICE_AUTO;
-      def->values[0].label = "Auto (first device)";
-      for (i = 0; i < device_count && i < max_devices; i++)
-         def->values[i + 1].value = option_device_names[i];
-      def->default_value = DEVICE_AUTO;
-      def++;
-
-      def->key  = OPTION_AUDIO;
-      def->desc = "Audio Input";
-      def->info = "Audio input played with the picture, for example the audio of the HDMI capture device. "
-                  "Auto picks the input whose name contains the capture device's name. "
-                  "Leave it off if the audio already reaches your speakers another way, for example through a mixer. "
-                  "Inputs are detected when the core starts.";
-      def->values[0].value = AUDIO_OFF;
-      def->values[0].label = "Off";
-      def->values[1].value = AUDIO_AUTO;
-      def->values[1].label = "Auto (match capture device)";
-      for (i = 0; i < audio_device_count && i < RETRO_NUM_CORE_OPTION_VALUES_MAX - 3; i++)
-         def->values[i + 2].value = option_audio_names[i];
-      def->default_value = AUDIO_OFF;
-      def++;
-
-      define_option(def++, "video", OPTION_CAPTURE_RES, "Capture Resolution",
-            "Resolution requested from the capture device. Auto uses the largest one up to 1080p. "
-            "Choose the resolution of the source, for example 720p for a 720p console, if the device "
-            "offers it: the device then does not scale the picture, which keeps pixel-perfect sources sharp. "
-            "If the device does not offer it, Auto is used. Changing this option reopens the device.",
-            "auto", capture_res_values);
-
-      define_option(def++, "video", OPTION_RESOLUTION, "Output Resolution",
-            "Resolution of the image passed to RetroArch and its shaders. "
-            "CRT and VHS shaders expect a low resolution such as 640x480 or 320x240. "
-            "Downscaling averages the source pixels to avoid aliasing.",
-            "native", resolution_values);
-
-      define_option(def++, "video", OPTION_ASPECT, "Aspect Ratio",
-            "Display aspect ratio reported to RetroArch. "
-            "4:3 (Squash) keeps the whole frame, for a 4:3 picture stretched to 16:9. "
-            "4:3 (Crop Pillarbox) keeps only the central 4:3 area, for a picture with black bars on the sides. "
-            "Requires Settings > Video > Scaling > Aspect Ratio set to Core Provided; a shader preset may override it.",
-            "source", aspect_values);
-
-      define_option(def++, "video", OPTION_CROP_H, "Crop Horizontal",
-            "Pixels of the captured image removed on the left and on the right, for example the black "
-            "borders around a pixel-perfect picture. Applied before Aspect Ratio and Output Resolution.",
-            "0", crop_values[0]);
-
-      define_option(def++, "video", OPTION_CROP_V, "Crop Vertical",
-            "Pixels of the captured image removed at the top and at the bottom. "
-            "Applied before Aspect Ratio and Output Resolution.",
-            "0", crop_values[1]);
-
-      define_option(def++, "video", OPTION_PACING, "Frame Pacing",
-            "The capture device and RetroArch run on separate clocks, so frames sometimes arrive "
-            "right when RetroArch asks for one. "
-            "Smooth shows every frame in order: at those moments only, it adds up to one frame of latency "
-            "(about 16 ms), and skips a single frame afterwards to catch up. Recommended to watch video. "
-            "Lowest Latency always shows the newest frame, but drops and repeats frames at those moments. "
-            "Recommended to play games through the capture device.",
-            "smooth", pacing_values);
-
-      define_option(def++, "color", OPTION_CONVERSION, "Color Conversion",
-            "Converts the device's YUV picture to the RGB format RetroArch needs. "
-            "Core converts after downscaling, which is faster at 640x480 and 320x240, "
-            "and applies the Color Space and Color Range options. "
-            "Media Foundation converts the full frame with Windows; Color Space and Color Range are then hidden. "
-            "Changing this option reopens the device.",
-            "core", conversion_values);
-
-      define_option(def++, "color", OPTION_COLOR_SPACE, "Color Space",
-            "Color matrix used to convert YUV to RGB. Default uses Rec. 601 up to 576 lines and Rec. 709 above. "
-            "Shown only when Color Conversion is set to Core.",
-            "default", color_space_values);
-
-      define_option(def++, "color", OPTION_COLOR_RANGE, "Color Range",
-            "Limited is standard for video: black is at level 16 and white at 235. "
-            "Use Full if blacks look gray or colors look washed out. "
-            "Shown only when Color Conversion is set to Core.",
-            "limited", color_range_values);
-
-      define_option(def++, "diagnostics", OPTION_STATS, "Show Capture Stats",
-            "Shows the frame rate received from the device and the frame rate shown, with the image sizes. "
-            "If the output frame rate is lower than the capture frame rate, frames are being dropped. "
-            "On-Screen Notification uses RetroArch's notifications. "
-            "In Image draws the text into the picture, before shaders.",
-            "off", stats_values);
-
-      define_option(def++, "diagnostics", OPTION_STATS_LOG, "Log Capture Stats",
-            "Writes the capture stats every second, with the age of each frame when shown, to "
-            "video_capture_stats.log in RetroArch's save directory. Useful to troubleshoot frame pacing. "
-            "Shown only when Show Capture Stats is on.",
-            "off", stats_log_values);
-
-      define_option(def++, "diagnostics", OPTION_DETAILS, "No Signal Details",
-            "Shows the reason and troubleshooting hints on the No Signal screen.",
-            "off", details_values);
-
-      options.categories  = option_categories;
-      options.definitions = option_definitions;
-      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &options);
-
-      {
-         struct retro_core_options_update_display_callback callback;
-         callback.callback = update_option_visibility;
-         environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK, &callback);
-      }
-   }
-   else
-   {
-      /* Legacy format: "Description; value1|value2|...", first value is the default. */
-      size_t len = (size_t)snprintf(legacy_device_values, sizeof(legacy_device_values),
-            "Capture Device; %s", DEVICE_AUTO);
-
-      for (i = 0; i < device_count && len < sizeof(legacy_device_values); i++)
-         len += (size_t)snprintf(legacy_device_values + len, sizeof(legacy_device_values) - len,
-               "|%s", option_device_names[i]);
-
-      legacy_variables[0].key   = OPTION_DEVICE;
-      legacy_variables[0].value = legacy_device_values;
-      legacy_variables[1].key   = OPTION_RESOLUTION;
-      legacy_variables[1].value = "Output Resolution; native|640x480|320x240";
-      legacy_variables[2].key   = OPTION_ASPECT;
-      legacy_variables[2].value = "Aspect Ratio; source|4_3_squash|4_3_crop|16_9";
-      legacy_variables[3].key   = OPTION_CONVERSION;
-      legacy_variables[3].value = "Color Conversion; core|media_foundation";
-      legacy_variables[4].key   = OPTION_COLOR_SPACE;
-      legacy_variables[4].value = "Color Space; default|rec709|rec601";
-      legacy_variables[5].key   = OPTION_COLOR_RANGE;
-      legacy_variables[5].value = "Color Range; limited|full";
-      legacy_variables[6].key   = OPTION_STATS;
-      legacy_variables[6].value = "Show Capture Stats; off|notification|image";
-      legacy_variables[7].key   = OPTION_DETAILS;
-      legacy_variables[7].value = "No Signal Details; off|on";
-      legacy_variables[8].key   = OPTION_PACING;
-      legacy_variables[8].value = "Frame Pacing; smooth|latest";
-      legacy_variables[9].key   = OPTION_STATS_LOG;
-      legacy_variables[9].value = "Log Capture Stats; off|on";
-      legacy_variables[10].key   = OPTION_CROP_H;
-      legacy_variables[10].value = legacy_crop_option(0, "Crop Horizontal");
-      legacy_variables[11].key   = OPTION_CROP_V;
-      legacy_variables[11].value = legacy_crop_option(1, "Crop Vertical");
-      legacy_variables[12].key   = OPTION_CAPTURE_RES;
-      legacy_variables[12].value = "Capture Resolution; auto|1080|720|576|480";
-      {
-         size_t audio_len = (size_t)snprintf(legacy_audio_values, sizeof(legacy_audio_values),
-               "Audio Input; %s|%s", AUDIO_OFF, AUDIO_AUTO);
-
-         for (i = 0; i < audio_device_count && audio_len < sizeof(legacy_audio_values); i++)
-            audio_len += (size_t)snprintf(legacy_audio_values + audio_len, sizeof(legacy_audio_values) - audio_len,
-                  "|%s", option_audio_names[i]);
-      }
-      legacy_variables[13].key   = OPTION_AUDIO;
-      legacy_variables[13].value = legacy_audio_values;
-      legacy_variables[14].key   = NULL;
-      legacy_variables[14].value = NULL;
-      environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, legacy_variables);
-   }
-}
-
-/* Returns the value of an option, or NULL if the frontend has none. */
-static const char *get_option(const char *key)
-{
-   struct retro_variable var;
-
-   var.key   = key;
-   var.value = NULL;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
-      return var.value;
-   return NULL;
-}
-
-static bool option_is(const char *value, const char *expected)
-{
-   return value && strcmp(value, expected) == 0;
-}
-
-/* Shows or hides an option. `state` remembers the last visibility (-1 when
- * unknown); returns true if it changed. */
-static bool set_option_visible(const char *key, bool visible, int *state)
-{
-   struct retro_core_option_display display;
-
-   if (*state == (int)visible)
-      return false;
-
-   display.key     = key;
-   display.visible = visible;
-   environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &display);
-   *state = visible;
-   return true;
-}
-
-/* Shows Log Capture Stats only when Show Capture Stats is on, and Color Space
- * and Color Range only when Color Conversion is set to Core (Media Foundation
- * ignores them). Called by the frontend when the options menu is displayed or
- * an option changes; returns true if a visibility changed. */
-static bool update_option_visibility(void)
-{
-   static int stats_log_state = -1, color_space_state = -1, color_range_state = -1;
-   const char *stats      = get_option(OPTION_STATS);
-   const bool show_log    = stats && !option_is(stats, "off");
-   const bool show_colors = !option_is(get_option(OPTION_CONVERSION), "media_foundation");
-   bool changed = false;
-
-   changed |= set_option_visible(OPTION_STATS_LOG, show_log, &stats_log_state);
-   changed |= set_option_visible(OPTION_COLOR_SPACE, show_colors, &color_space_state);
-   changed |= set_option_visible(OPTION_COLOR_RANGE, show_colors, &color_range_state);
-   return changed;
-}
-
-/* Last value of each option, to log changes in the stats log. */
-static char option_last_values[sizeof(option_definitions) / sizeof(option_definitions[0])][288];
-
-/* Returns the label shown for an option value. */
-static const char *option_label(const struct retro_core_option_v2_definition *def, const char *value)
-{
-   int i;
-
-   for (i = 0; def->values[i].value; i++)
-      if (strcmp(def->values[i].value, value) == 0)
-         return def->values[i].label ? def->values[i].label : value;
-   return value;
-}
-
-/* Writes the options to the stats log: all of them with `all`, otherwise only
- * those changed since the previous call. */
-static void log_options(bool all)
-{
-   int i;
-
-   for (i = 0; option_definitions[i].key; i++)
-   {
-      const struct retro_core_option_v2_definition *def = &option_definitions[i];
-      const char *value = get_option(def->key);
-
-      if (!value)
-         continue;
-      if (all || strcmp(value, option_last_values[i]) != 0)
-         stats_log_printf("%s%s: %s.", all ? "  " : "Option changed: ", def->desc, option_label(def, value));
-      snprintf(option_last_values[i], sizeof(option_last_values[i]), "%s", value);
-   }
-}
-
-/* Reads every option except the device, which apply_device_selection() handles. */
-static void read_options(void)
-{
-   const char *value;
-
-   value = get_option(OPTION_RESOLUTION);
-   opt_resolution = option_is(value, "640x480") ? RESOLUTION_640X480
-                  : option_is(value, "320x240") ? RESOLUTION_320X240
-                  : RESOLUTION_NATIVE;
-
-   value = get_option(OPTION_ASPECT);
-   opt_aspect = option_is(value, "4_3_squash") ? ASPECT_4_3_SQUASH
-              : option_is(value, "4_3_crop")   ? ASPECT_4_3_CROP
-              : option_is(value, "16_9")       ? ASPECT_16_9
-              : ASPECT_SOURCE;
-
-   value = get_option(OPTION_CAPTURE_RES);
-   opt_capture_height = value && !option_is(value, "auto") ? (unsigned)strtoul(value, NULL, 10) : 0;
-
-   value = get_option(OPTION_CROP_H);
-   opt_crop_h = value ? (unsigned)strtoul(value, NULL, 10) & ~1u : 0;
-   value = get_option(OPTION_CROP_V);
-   opt_crop_v = value ? (unsigned)strtoul(value, NULL, 10) & ~1u : 0;
-
-   opt_core_convert = !option_is(get_option(OPTION_CONVERSION), "media_foundation");
-
-   value = get_option(OPTION_COLOR_SPACE);
-   opt_color_space = option_is(value, "rec709") ? COLOR_SPACE_REC709
-                   : option_is(value, "rec601") ? COLOR_SPACE_REC601
-                   : COLOR_SPACE_DEFAULT;
-
-   opt_color_range = option_is(get_option(OPTION_COLOR_RANGE), "full") ? COLOR_RANGE_FULL : COLOR_RANGE_LIMITED;
-
-   value = get_option(OPTION_STATS);
-   opt_stats = option_is(value, "notification") ? STATS_NOTIFICATION
-             : option_is(value, "image")        ? STATS_IMAGE
-             : STATS_OFF;
-
-   opt_details       = option_is(get_option(OPTION_DETAILS), "on");
-   opt_smooth_pacing = !option_is(get_option(OPTION_PACING), "latest");
-   opt_stats_log     = option_is(get_option(OPTION_STATS_LOG), "on");
-}
-
-/* Returns the index of the device selected in the core options, or -1. */
-static int selected_device_index(void)
-{
-   const char *value = get_option(OPTION_DEVICE);
-   int i;
-
-   if (device_count == 0)
-      return -1;
-
-   if (value && strcmp(value, DEVICE_AUTO) != 0)
-   {
-      for (i = 0; i < device_count; i++)
-         if (strcmp(value, option_device_names[i]) == 0)
-            return i;
-
-      log_cb(RETRO_LOG_WARN, LOG_PREFIX "Device \"%s\" not found, using the first device.\n", value);
-   }
-
-   return 0;
-}
 
 /* Logs a summary of the capture session: average rates and frames lost.
  * Called when the device is closed, so the log keeps a trace of dropped
@@ -869,7 +296,7 @@ static void log_session_stats(void)
    /* The session ends at the last retro_run(): time spent in RetroArch's menu
     * before closing the content is not counted. */
    const bool at_last_run  = last_run_usec > session_start_time;
-   const retro_time_t now  = at_last_run ? last_run_usec : perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const retro_time_t now  = at_last_run ? last_run_usec : core_time_usec();
    const uint64_t received = (at_last_run ? last_run_received : capture_frames_received()) - session_paused_frames;
    double seconds, paused;
 
@@ -891,14 +318,12 @@ static void log_session_stats(void)
          seconds, paused, received / seconds, session_runs / seconds, session_frames_shown / seconds,
          (unsigned long long)session_dropped, (unsigned long long)session_pacing_skips,
          (unsigned long long)session_repeated);
-   if (active_audio_id[0])
-      stats_log_printf("Audio: %llu underrun(s), %llu resync(s).",
-            (unsigned long long)session_audio_underruns, (unsigned long long)session_audio_resyncs);
+   audio_output_log_session();
 }
 
 static void reset_session_stats(void)
 {
-   session_start_time   = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   session_start_time   = core_time_usec();
    session_frames_shown  = 0;
    session_runs          = 0;
    session_dropped       = 0;
@@ -906,17 +331,23 @@ static void reset_session_stats(void)
    session_repeated      = 0;
    session_paused_usec   = 0;
    session_paused_frames = 0;
-   session_audio_underruns = 0;
-   session_audio_resyncs   = 0;
+   audio_output_reset_session();
 }
 
 static void restart_stats_second(retro_time_t end);
 
-/* Opens the selected device. Without `force`, does nothing if the device and
- * conversion mode are unchanged. */
+/* ------------------------------------------------------------------------ */
+/* Device selection                                                          */
+/* ------------------------------------------------------------------------ */
+
+/* Opens the device selected in the core options. Without `force`, does
+ * nothing if the device and the options that require reopening it (Color
+ * Conversion, Capture Resolution) are unchanged. With `force`, reopens it
+ * anyway: this is how a device that failed is retried. */
 static void apply_device_selection(bool force)
 {
-   const int index = selected_device_index();
+   static bool start_failed; /* The device could not be opened; already reported */
+   const int index = options_device_index();
 
    if (index < 0)
    {
@@ -929,6 +360,9 @@ static void apply_device_selection(bool force)
        active_core_convert == opt_core_convert && active_capture_height == opt_capture_height)
       return;
 
+   if (strcmp(devices[index].id, active_device_id) != 0)
+      start_failed = false; /* Another device: report its failure, if any */
+
    snprintf(active_device_id, sizeof(active_device_id), "%s", devices[index].id);
    active_device_name    = option_device_names[index];
    active_core_convert   = opt_core_convert;
@@ -938,7 +372,7 @@ static void apply_device_selection(bool force)
    seconds_black         = 0.0;
    retry_timer           = RETRY_INTERVAL;
 
-   restart_stats_second(perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0);
+   restart_stats_second(core_time_usec());
    log_session_stats();
    reset_session_stats();
    shown_sequence       = 0;
@@ -949,282 +383,25 @@ static void apply_device_selection(bool force)
    rate_candidate       = 0.0;
 
    if (capture_start(devices[index].id, opt_core_convert, opt_capture_height))
+   {
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
-   else
-      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s\n", capture_last_error());
+      start_failed = false;
+   }
+   else if (!start_failed)
+   {
+      /* Logged once: the retries every RETRY_INTERVAL would repeat it. */
+      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s Retrying every few seconds.\n",
+            capture_last_error());
+      start_failed = true;
+   }
 
    /* The time until the next retro_run() is treated like a pause: at startup,
     * RetroArch sets up its video driver and shaders after loading the core. */
-   last_run_usec     = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   last_run_usec     = core_time_usec();
    last_run_received = capture_frames_received();
    waiting_first_run = true;
 
-   stats_lines[0][0]   = '\0';
-}
-
-/* Shows a message for `duration_ms` in RetroArch's notifications. */
-static void show_notification(const char *text, unsigned duration_ms)
-{
-   if (message_interface_version >= 1)
-   {
-      struct retro_message_ext message;
-
-      message.msg      = text;
-      message.duration = duration_ms;
-      message.priority = 1;
-      message.level    = RETRO_LOG_INFO;
-      message.target   = RETRO_MESSAGE_TARGET_OSD;
-      message.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
-      message.progress = -1;
-      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
-   }
-   else
-   {
-      struct retro_message message;
-
-      message.msg    = text;
-      message.frames = (unsigned)(output_fps * duration_ms / 1000.0);
-      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
-   }
-}
-
-/* Copies the letters and digits of `text` to `out`, in lowercase: "Cam Link
- * Pro HDMI-4" becomes "camlinkprohdmi4". */
-static void simplify_name(const char *text, char *out, size_t size)
-{
-   size_t n = 0;
-
-   for (; *text && n + 1 < size; text++)
-      if (isalnum((unsigned char)*text))
-         out[n++] = (char)tolower((unsigned char)*text);
-   out[n] = '\0';
-}
-
-/* True if `text` contains the number `number` on its own: "Audio-4" contains
- * 4, "Audio-14" does not. */
-static bool contains_number(const char *text, unsigned long number)
-{
-   while (*text)
-   {
-      if (isdigit((unsigned char)*text))
-      {
-         char *end;
-         const unsigned long value = strtoul(text, &end, 10);
-
-         if (value == number)
-            return true;
-         text = end;
-      }
-      else
-         text++;
-   }
-   return false;
-}
-
-/*
- * Returns the index of the audio input that goes with the capture device
- * `video`, or -1. Device makers name them differently, for example:
- *   "Elgato 4K X"         -> "Digital Audio Interface (Elgato 4K X)"
- *   "Cam Link Pro HDMI-4" -> "Cam Link Pro Audio-4 (Cam Link Pro)"
- * First, an input whose name contains the device's name (letters and digits
- * only, ignoring case). Otherwise, if the device's name contains a number (the
- * input number of a multi-input device), an input whose name contains both
- * the text before the word holding that number ("Cam Link Pro") and the same
- * number.
- */
-static int match_audio_input(const char *video)
-{
-   char video_simple[300], audio_simple[300], base[300], base_simple[300];
-   const char *number_start = NULL, *word_start, *p;
-   unsigned long number;
-   size_t base_len;
-   int i;
-
-   simplify_name(video, video_simple, sizeof(video_simple));
-   if (!video_simple[0])
-      return -1;
-
-   for (i = 0; i < audio_device_count; i++)
-   {
-      simplify_name(audio_devices[i].name, audio_simple, sizeof(audio_simple));
-      if (strstr(audio_simple, video_simple))
-         return i;
-   }
-
-   /* Last number of the device's name, and the word holding it. */
-   for (p = video; *p; p++)
-      if (isdigit((unsigned char)*p) && (p == video || !isdigit((unsigned char)p[-1])))
-         number_start = p;
-   if (!number_start)
-      return -1;
-   number = strtoul(number_start, NULL, 10);
-
-   word_start = number_start;
-   while (word_start > video && word_start[-1] != ' ')
-      word_start--;
-   base_len = (size_t)(word_start - video);
-   if (base_len == 0 || base_len >= sizeof(base))
-      return -1;
-   memcpy(base, video, base_len);
-   base[base_len] = '\0';
-   simplify_name(base, base_simple, sizeof(base_simple));
-   if (!base_simple[0])
-      return -1;
-
-   for (i = 0; i < audio_device_count; i++)
-   {
-      simplify_name(audio_devices[i].name, audio_simple, sizeof(audio_simple));
-      if (strstr(audio_simple, base_simple) && contains_number(audio_devices[i].name, number))
-         return i;
-   }
-   return -1;
-}
-
-/* Opens the audio input selected in the core options; Auto uses
- * match_audio_input() and shows its choice in a notification. Without
- * `force`, nothing happens if that input is already open. */
-static void apply_audio_selection(bool force)
-{
-   const char *value = get_option(OPTION_AUDIO);
-   const bool auto_select = option_is(value, AUDIO_AUTO);
-   int index = -1, i;
-
-   if (auto_select)
-      index = match_audio_input(active_device_name);
-   else if (value && !option_is(value, AUDIO_OFF))
-   {
-      for (i = 0; i < audio_device_count && index < 0; i++)
-         if (strcmp(option_audio_names[i], value) == 0)
-            index = i;
-   }
-
-   if (!force && strcmp(index >= 0 ? audio_devices[index].id : "", active_audio_id) == 0)
-      return;
-
-   audio_stop();
-   snprintf(active_audio_id, sizeof(active_audio_id), "%s", index >= 0 ? audio_devices[index].id : "");
-   audio_buffering   = true;
-   audio_in_pending  = 0.0;
-   audio_retry_timer = RETRY_INTERVAL;
-
-   if (index < 0)
-   {
-      if (auto_select && active_device_name[0])
-      {
-         log_cb(RETRO_LOG_WARN, LOG_PREFIX "No audio input matches \"%s\"; select one in Audio Input.\n",
-               active_device_name);
-         stats_log_printf("Audio: no input matches \"%s\".", active_device_name);
-         show_notification("Audio Input: no input matches the capture device, select one manually.", 5000);
-      }
-      return;
-   }
-
-   if (auto_select)
-   {
-      char text[320];
-
-      snprintf(text, sizeof(text), "Audio Input: %s", option_audio_names[index]);
-      show_notification(text, 4000);
-   }
-
-   if (audio_start(audio_devices[index].id))
-   {
-      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Audio started: %s (%u Hz).\n", option_audio_names[index],
-            audio_sample_rate());
-      stats_log_printf("Audio started: %s (%u Hz).", option_audio_names[index], audio_sample_rate());
-   }
-   else
-   {
-      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start audio: %s.\n", option_audio_names[index]);
-      stats_log_printf("Could not start audio: %s.", option_audio_names[index]);
-   }
-}
-
-/* Linear interpolation of `in_frames` stereo frames into `out_frames`. */
-static void resample_linear(const int16_t *in, size_t in_frames, int16_t *out, size_t out_frames)
-{
-   size_t i;
-
-   for (i = 0; i < out_frames; i++)
-   {
-      const double pos  = (double)i * (double)in_frames / (double)out_frames;
-      const size_t a    = (size_t)pos;
-      const size_t b    = a + 1 < in_frames ? a + 1 : a;
-      const double frac = pos - (double)a;
-
-      out[i * 2]     = (int16_t)(in[a * 2] + (in[b * 2] - in[a * 2]) * frac);
-      out[i * 2 + 1] = (int16_t)(in[a * 2 + 1] + (in[b * 2 + 1] - in[a * 2 + 1]) * frac);
-   }
-}
-
-/*
- * Sends `frames` stereo frames at SAMPLE_RATE to the frontend: captured audio
- * if an input is open, silence otherwise.
- *
- * The input runs on the capture device's clock and RetroArch on the computer's,
- * so the amount of buffered input slowly drifts. The core keeps about
- * AUDIO_TARGET_FRAMES buffered: it reads slightly more or less input than it
- * outputs (up to AUDIO_MAX_ADJUST), and resamples it to the output length.
- * After a pause, when the buffer holds far too much, the excess is dropped;
- * when it runs dry, the core waits for the target again, outputting silence.
- */
-static void output_audio(size_t frames)
-{
-   const double base   = (double)audio_sample_rate() / SAMPLE_RATE;
-   const double target = AUDIO_TARGET_FRAMES * base;
-   size_t level, in_frames, got;
-   double adjust;
-
-   if (!active_audio_id[0] || !audio_is_running())
-   {
-      audio_buffering = true;
-      audio_batch_cb(silence, frames);
-      return;
-   }
-
-   level = audio_available();
-
-   if (audio_buffering)
-   {
-      if ((double)level < target)
-      {
-         audio_batch_cb(silence, frames);
-         return;
-      }
-      audio_buffering = false;
-   }
-
-   /* Far too much buffered (after a pause): drop the excess. */
-   if ((double)level > target * 3.0 + frames * base)
-   {
-      audio_discard(level - (size_t)target);
-      level = (size_t)target;
-      session_audio_resyncs++;
-   }
-
-   adjust = AUDIO_MAX_ADJUST * ((double)level - target) / target;
-   if (adjust > AUDIO_MAX_ADJUST)  adjust = AUDIO_MAX_ADJUST;
-   if (adjust < -AUDIO_MAX_ADJUST) adjust = -AUDIO_MAX_ADJUST;
-
-   audio_in_pending += (double)frames * base * (1.0 + adjust);
-   in_frames = (size_t)audio_in_pending;
-   if (in_frames > sizeof(audio_in) / sizeof(audio_in[0]) / 2)
-      in_frames = sizeof(audio_in) / sizeof(audio_in[0]) / 2;
-   if (in_frames == 0)
-      in_frames = 1;
-   audio_in_pending -= (double)in_frames;
-
-   got = audio_read(audio_in, in_frames);
-   if (got < in_frames)
-   {
-      /* Ran dry: pad with silence and wait for the target again. */
-      memset(audio_in + got * 2, 0, (in_frames - got) * 2 * sizeof(int16_t));
-      audio_buffering = true;
-      session_audio_underruns++;
-   }
-
-   resample_linear(audio_in, in_frames, audio_out, frames);
-   audio_batch_cb(audio_out, frames);
+   stats_lines[0][0] = '\0';
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1513,7 +690,7 @@ static void restart_stats_second(retro_time_t end)
  * between the device and the frontend. */
 static void update_stats(void)
 {
-   const retro_time_t now = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
+   const retro_time_t now = core_time_usec();
    const uint64_t received = capture_frames_received();
    double seconds;
 
@@ -1540,34 +717,32 @@ static void update_stats(void)
    if (seconds < 1.0)
       return;
 
+   stats_capture_fps  = (double)(received - stats_last_received) / seconds;
+   stats_frontend_fps = (double)stats_runs / seconds;
+   stats_output_fps   = (double)stats_frames_shown / seconds;
+
    /* Stats log: one line per second. */
-   {
-      const uint64_t received_delta = received - stats_last_received;
+   stats_seconds++;
+   stats_log_printf("t=%us capture %.2f RetroArch %.2f output %.2f fps | dropped %llu "
+         "(pacing skips %llu), repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
+         stats_seconds, stats_capture_fps, stats_frontend_fps, stats_output_fps,
+         (unsigned long long)stats_dropped,
+         (unsigned long long)stats_pacing_skips,
+         (unsigned long long)stats_repeated,
+         frame_age_count ? frame_age_min_ms : 0.0,
+         frame_age_count ? frame_age_sum_ms / frame_age_count : 0.0,
+         frame_age_count ? frame_age_max_ms : 0.0);
 
-      stats_seconds++;
-      stats_log_printf("t=%us capture %.2f RetroArch %.2f output %.2f fps | dropped %llu "
-            "(pacing skips %llu), repeated %llu | frame age min %.1f avg %.1f max %.1f ms",
-            stats_seconds, received_delta / seconds, stats_runs / seconds, stats_frames_shown / seconds,
-            (unsigned long long)stats_dropped,
-            (unsigned long long)stats_pacing_skips,
-            (unsigned long long)stats_repeated,
-            frame_age_count ? frame_age_min_ms : 0.0,
-            frame_age_count ? frame_age_sum_ms / frame_age_count : 0.0,
-            frame_age_count ? frame_age_max_ms : 0.0);
-      frame_age_sum_ms   = 0.0;
-      frame_age_count    = 0;
-      stats_pacing_skips = 0;
-      stats_dropped      = 0;
-      stats_repeated     = 0;
-   }
-
-   stats_capture_fps   = (double)(received - stats_last_received) / seconds;
-   stats_frontend_fps  = (double)stats_runs / seconds;
-   stats_output_fps    = (double)stats_frames_shown / seconds;
+   /* Start the next second. */
    stats_last_time     = now;
    stats_last_received = received;
    stats_frames_shown  = 0;
    stats_runs          = 0;
+   stats_dropped       = 0;
+   stats_pacing_skips  = 0;
+   stats_repeated      = 0;
+   frame_age_sum_ms    = 0.0;
+   frame_age_count     = 0;
 
    snprintf(stats_lines[0], sizeof(stats_lines[0]), "Capture:   %6.2f fps  %ux%u %s",
          stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format));
@@ -1588,27 +763,8 @@ static void update_stats(void)
             stats_capture_fps, last_frame.width, last_frame.height, format_name(last_frame.format),
             stats_frontend_fps, stats_output_fps, output_width, output_height);
 
-      if (message_interface_version >= 1)
-      {
-         struct retro_message_ext message;
-
-         message.msg      = text;
-         message.duration = 2000; /* Milliseconds; refreshed every second */
-         message.priority = 1;
-         message.level    = RETRO_LOG_INFO;
-         message.target   = RETRO_MESSAGE_TARGET_OSD;
-         message.type     = RETRO_MESSAGE_TYPE_STATUS;
-         message.progress = -1;
-         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &message);
-      }
-      else
-      {
-         struct retro_message message;
-
-         message.msg    = text;
-         message.frames = (unsigned)(output_fps * 2.0);
-         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
-      }
+      /* Shown for 2 seconds and refreshed every second, so it stays up. */
+      send_message(text, 2000, RETRO_MESSAGE_TYPE_STATUS);
    }
 }
 
@@ -1639,157 +795,6 @@ static void draw_stats_overlay(uint32_t *image, size_t pitch, unsigned width, un
    for (i = 0; i < STATS_LINES; i++)
       font_draw_text(image, pitch, width, height, (int)margin, (int)(margin + i * line_height),
             stats_lines[i], scale, stats_colors[i]);
-}
-
-/* ------------------------------------------------------------------------ */
-/* No Signal screen                                                          */
-/* ------------------------------------------------------------------------ */
-
-/* 75% SMPTE color bars: white, yellow, cyan, green, magenta, red, blue. */
-static const uint32_t bar_colors[7] = {
-   0xBFBFBF, 0xBFBF00, 0x00BFBF, 0x00BF00, 0xBF00BF, 0xBF0000, 0x0000BF
-};
-
-/* Splits `text` into lines of at most `max_chars` characters, breaking at
- * spaces. Returns the number of lines written to `lines`. */
-static int wrap_text(const char *text, unsigned max_chars, char lines[][96], int max_lines)
-{
-   int count = 0;
-
-   while (*text && count < max_lines)
-   {
-      size_t len = strlen(text);
-      size_t cut = len;
-
-      if (len > max_chars)
-      {
-         cut = max_chars;
-         while (cut > 0 && text[cut] != ' ')
-            cut--;
-         if (cut == 0)
-            cut = max_chars; /* A single word longer than a line */
-      }
-
-      if (cut > 95)
-         cut = 95;
-      memcpy(lines[count], text, cut);
-      lines[count][cut] = '\0';
-      count++;
-
-      text += cut;
-      while (*text == ' ')
-         text++;
-   }
-
-   return count;
-}
-
-/* Draws text centered horizontally at row y. */
-static void draw_centered(const char *text, int y, unsigned scale, uint32_t color)
-{
-   const int x = ((int)SCREEN_WIDTH - (int)font_text_width(text, scale)) / 2;
-   font_draw_text(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
-         x, y, text, scale, color);
-}
-
-/* Returns the reason text and a troubleshooting hint for a signal state. */
-static void describe_signal_state(enum signal_state state, char *reason, size_t reason_size,
-      char *hint, size_t hint_size)
-{
-   switch (state)
-   {
-      case SIGNAL_NO_DEVICE:
-         snprintf(reason, reason_size, "No capture device was found.");
-         snprintf(hint, hint_size, "Connect the device, then restart the core. "
-               "Devices are detected when the core starts.");
-         break;
-      case SIGNAL_DEVICE_ERROR:
-         snprintf(reason, reason_size, "%s", capture_last_error()[0]
-               ? capture_last_error() : "The device could not be opened.");
-         snprintf(hint, hint_size, "The core tries to reopen the device every few seconds.");
-         break;
-      case SIGNAL_BLACK:
-         snprintf(reason, reason_size, "The device is connected, but receives no picture from its source.");
-         snprintf(hint, hint_size, "Check that the source is turned on, that its cable is plugged into "
-               "the input selected in Capture Device, and that its output resolution is supported. "
-               "Another application, such as OBS, may also be using the device.");
-         break;
-      case SIGNAL_NO_FRAMES:
-      default:
-         snprintf(reason, reason_size, "The device is open, but sends no frames.");
-         snprintf(hint, hint_size, "Check the source and its cable. Another application, such as OBS, "
-               "may also be using the device. If the problem persists, "
-               "try Color Conversion set to Media Foundation, or reconnect the device.");
-         break;
-   }
-}
-
-/* Draws the No Signal screen: color bars with a black panel in the middle
- * showing the title, the device name and, optionally, the details. The screen
- * is redrawn only when its content changes. */
-static void render_no_signal_screen(enum signal_state state)
-{
-   const char *title = state == SIGNAL_NO_DEVICE ? "NO DEVICE"
-                     : state == SIGNAL_DEVICE_ERROR ? "DEVICE ERROR"
-                     : "NO SIGNAL";
-   char reason[512], hint[512], key[sizeof(screen_key)];
-   char lines[12][96];
-   const int bars_height = (SCREEN_HEIGHT * 2) / 3;
-   const int panel_x = 40, panel_w = SCREEN_WIDTH - 80;
-   int line_count = 0, panel_h, panel_y, y, x, i;
-
-   describe_signal_state(state, reason, sizeof(reason), hint, sizeof(hint));
-   snprintf(key, sizeof(key), "%d|%d|%s|%s", (int)state, (int)opt_details, active_device_name, reason);
-   if (strcmp(key, screen_key) == 0)
-      return;
-   snprintf(screen_key, sizeof(screen_key), "%s", key);
-
-   /* Background: color bars over a luminance ramp. */
-   for (y = 0; y < SCREEN_HEIGHT; y++)
-   {
-      uint32_t *row = &screen_buffer[y * SCREEN_WIDTH];
-      for (x = 0; x < SCREEN_WIDTH; x++)
-      {
-         uint32_t v = (uint32_t)((x * 255) / (SCREEN_WIDTH - 1));
-         row[x] = y < bars_height ? bar_colors[(x * 7) / SCREEN_WIDTH] : (v << 16) | (v << 8) | v;
-      }
-   }
-
-   /* Detail lines, wrapped to the panel width (8 px characters). */
-   if (opt_details)
-   {
-      line_count  = wrap_text(reason, (unsigned)(panel_w - 32) / FONT_GLYPH_SIZE, lines, 6);
-      lines[line_count++][0] = '\0'; /* Blank line */
-      line_count += wrap_text(hint, (unsigned)(panel_w - 32) / FONT_GLYPH_SIZE, lines + line_count, 5);
-   }
-   else
-   {
-      snprintf(lines[0], sizeof(lines[0]), "Set No Signal Details to On in Core Options for help.");
-      line_count = 1;
-   }
-
-   /* Panel: title (32 px), device name (16 px), then the detail lines (12 px each). */
-   panel_h = 24 + 32 + 16 + (active_device_name[0] ? 24 : 0) + 8 + line_count * 12 + 16;
-   panel_y = (SCREEN_HEIGHT - panel_h) / 2;
-   font_fill_rect(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
-         panel_x, panel_y, panel_w, panel_h, 0x000000);
-
-   y = panel_y + 24;
-   draw_centered(title, y, 4, 0xFFFFFF);
-   y += 32 + 16;
-
-   if (active_device_name[0])
-   {
-      char name[40];
-      snprintf(name, sizeof(name), "%.36s%s", active_device_name, strlen(active_device_name) > 36 ? "..." : "");
-      draw_centered(name, y, 2, 0xC0C0C0);
-      y += 24;
-   }
-
-   y += 8;
-   for (i = 0; i < line_count; i++, y += 12)
-      font_draw_text(screen_buffer, SCREEN_WIDTH * sizeof(uint32_t), SCREEN_WIDTH, SCREEN_HEIGHT,
-            panel_x + 16, y, lines[i], 1, 0xA0A0A0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1903,12 +908,13 @@ static void output_capture_frame(void)
 
 static void output_no_signal_screen(enum signal_state state)
 {
-   render_no_signal_screen(state);
-   set_output_geometry(SCREEN_WIDTH, SCREEN_HEIGHT, 4.0f / 3.0f);
-   last_output       = screen_buffer;
-   last_output_pitch = SCREEN_WIDTH * sizeof(uint32_t);
+   const uint32_t *screen = no_signal_render(state, opt_details, active_device_name);
+
+   set_output_geometry(NO_SIGNAL_WIDTH, NO_SIGNAL_HEIGHT, 4.0f / 3.0f);
+   last_output       = screen;
+   last_output_pitch = NO_SIGNAL_WIDTH * sizeof(uint32_t);
    showing_capture   = false;
-   video_cb(screen_buffer, SCREEN_WIDTH, SCREEN_HEIGHT, last_output_pitch);
+   video_cb(screen, NO_SIGNAL_WIDTH, NO_SIGNAL_HEIGHT, last_output_pitch);
 }
 
 /*
@@ -1920,7 +926,8 @@ static void output_no_signal_screen(enum signal_state state)
  * arrive before one call and none before the next.
  *
  * Lowest Latency always shows the newest frame. In the collision zone, this
- * alternates dropped and repeated frames for a few seconds.
+ * alternates dropped and repeated frames for as long as the two stay close:
+ * a few seconds if the rates differ slightly, a minute or more if they match.
  *
  * Smooth advances one frame per call: when two frames are ready, it shows the
  * older one instead of dropping it, which costs one frame of latency. Once
@@ -1952,6 +959,8 @@ static bool pick_frame(capture_frame_t *frame)
       /* Behind by one frame, away from the collision zone: count down to a catch-up. */
       pacing_safe_runs = (backlog >= 2 && safe_phase) ? pacing_safe_runs + 1 : 0;
 
+      /* Two frames behind (for example after a stall), or one frame behind for
+       * a while outside the collision zone: jump to the newest frame. */
       if (backlog >= 3 || pacing_safe_runs >= PACING_SKIP_RUNS)
       {
          stats_pacing_skips   += backlog - 1;
@@ -2073,18 +1082,58 @@ static void present_frame(bool options_changed)
       return;
    }
 
-   screen_key[0] = '\0'; /* Redraw the No Signal screen next time it appears */
+   no_signal_invalidate(); /* Redraw the No Signal screen next time it appears */
 
    if (opt_stats != STATS_OFF)
       update_stats();
 
    /* Show the new settings right away, even without a new frame. */
-   if (new_frame || options_changed || last_output == screen_buffer)
+   if (new_frame || options_changed || !showing_capture)
       output_capture_frame();
    else if (can_dupe)
       video_cb(NULL, output_width, output_height, last_output_pitch);
    else
       video_cb(last_output, output_width, output_height, last_output_pitch);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Pause detection                                                           */
+/* ------------------------------------------------------------------------ */
+
+/* Detects pauses (RetroArch's menu, shader setup) from the time since the
+ * previous call. A pause restarts the current stats second, excludes the
+ * pause from the session summary, and makes the core resume on the newest
+ * frame. */
+static void detect_pause(void)
+{
+   const retro_time_t now  = core_time_usec();
+   const uint64_t received = capture_frames_received();
+   const bool first_run    = waiting_first_run;
+
+   waiting_first_run = false;
+   if (!now)
+      return;
+
+   if (last_run_usec && now - last_run_usec >= STALL_THRESHOLD_USEC)
+   {
+      const retro_time_t gap = now - last_run_usec;
+
+      session_paused_usec   += gap;
+      session_paused_frames += received >= last_run_received ? received - last_run_received : 0;
+      restart_stats_second(last_run_usec);
+      pacing_resync          = true;
+
+      if (first_run)
+         stats_log_printf("RetroArch started running the core %.1f s after the device opened.",
+               (double)gap / 1000000.0);
+      else if (gap >= PAUSE_THRESHOLD_USEC)
+         stats_log_printf("Paused for %.1f s.", (double)gap / 1000000.0);
+      else
+         stats_log_printf("RetroArch stalled for %.0f ms.", (double)gap / 1000.0);
+   }
+
+   last_run_usec     = now;
+   last_run_received = received;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2114,26 +1163,25 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
    /* The core starts without content ("Start Core") or with a .vidcap file. */
    environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);
 
-   refresh_device_list();
-   declare_core_options();
+   options_find_devices();
+   options_declare();
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb)           { video_cb = cb; }
 RETRO_API void retro_set_audio_sample(retro_audio_sample_t cb)             { audio_cb = cb; }
-RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_batch_cb = cb; }
+RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { audio_output_set_callback(cb); }
 RETRO_API void retro_set_input_poll(retro_input_poll_t cb)                 { input_poll_cb = cb; }
 RETRO_API void retro_set_input_state(retro_input_state_t cb)               { input_state_cb = cb; }
 
 RETRO_API void retro_init(void)
 {
-   memset(silence, 0, sizeof(silence));
-   screen_key[0] = '\0';
+   no_signal_invalidate();
 }
 
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
-   audio_stop();
+   audio_output_close();
    if (stats_log_file)
    {
       fclose(stats_log_file);
@@ -2175,43 +1223,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 RETRO_API void retro_reset(void)
 {
    apply_device_selection(true);
-   apply_audio_selection(true);
-}
-
-/* Detects pauses (RetroArch's menu, shader setup) from the time since the
- * previous call. A pause restarts the current stats second, excludes the
- * pause from the session summary, and makes the core resume on the newest
- * frame. */
-static void detect_pause(void)
-{
-   const retro_time_t now  = perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0;
-   const uint64_t received = capture_frames_received();
-   const bool first_run    = waiting_first_run;
-
-   waiting_first_run = false;
-   if (!now)
-      return;
-
-   if (last_run_usec && now - last_run_usec >= STALL_THRESHOLD_USEC)
-   {
-      const retro_time_t gap = now - last_run_usec;
-
-      session_paused_usec   += gap;
-      session_paused_frames += received >= last_run_received ? received - last_run_received : 0;
-      restart_stats_second(last_run_usec);
-      pacing_resync          = true;
-
-      if (first_run)
-         stats_log_printf("RetroArch started running the core %.1f s after the device opened.",
-               (double)gap / 1000000.0);
-      else if (gap >= PAUSE_THRESHOLD_USEC)
-         stats_log_printf("Paused for %.1f s.", (double)gap / 1000000.0);
-      else
-         stats_log_printf("RetroArch stalled for %.0f ms.", (double)gap / 1000.0);
-   }
-
-   last_run_usec     = now;
-   last_run_received = received;
+   audio_output_select(true, active_device_name);
 }
 
 RETRO_API void retro_run(void)
@@ -2226,39 +1238,17 @@ RETRO_API void retro_run(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
-      read_options();
-      log_options(false);
+      options_read();
+      options_log(false);
       update_stats_log_file();
       apply_device_selection(false);
-      apply_audio_selection(false);
-      screen_key[0] = '\0';
+      audio_output_select(false, active_device_name);
+      no_signal_invalidate();
    }
 
    present_frame(updated);
 
-   /* Audio input lost (device unplugged): retry periodically. */
-   if (active_audio_id[0] && !audio_is_running())
-   {
-      audio_retry_timer -= 1.0 / output_fps;
-      if (audio_retry_timer <= 0.0)
-         apply_audio_selection(true);
-   }
-
-   /* Audio matching the frame rate (800.8 frames per video frame at 59.94 fps). */
-   if (audio_batch_cb)
-   {
-      size_t frames;
-
-      audio_frames_pending += SAMPLE_RATE / output_fps;
-      frames = (size_t)audio_frames_pending;
-      if (frames > AUDIO_FRAMES_MAX)
-         frames = AUDIO_FRAMES_MAX;
-      audio_frames_pending -= (double)frames;
-      if (audio_frames_pending > AUDIO_FRAMES_MAX)
-         audio_frames_pending = 0.0;
-
-      output_audio(frames);
-   }
+   audio_output_run(output_fps);
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
@@ -2283,12 +1273,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    if (game && game->path)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Content: %s\n", game->path);
 
-   read_options();
+   options_read();
    update_stats_log_file();
    active_device_id[0] = '\0';
    apply_device_selection(true);
-   active_audio_id[0] = '\0';
-   apply_audio_selection(true);
+   audio_output_close();
+   audio_output_select(true, active_device_name);
    crop_size_width  = 0;
    crop_size_height = 0;
 
@@ -2307,11 +1297,10 @@ RETRO_API bool retro_load_game_special(unsigned type, const struct retro_game_in
 
 RETRO_API void retro_unload_game(void)
 {
-   restart_stats_second(perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0);
+   restart_stats_second(core_time_usec());
    log_session_stats();
    capture_stop();
-   audio_stop();
-   active_audio_id[0]  = '\0';
+   audio_output_close();
    active_device_id[0] = '\0';
    have_frame          = false;
 }

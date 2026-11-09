@@ -117,23 +117,41 @@ static void ring_clear(void)
    g_ring_count = 0;
 }
 
+/* Copies `count` frames between the ring and a linear buffer, starting at ring
+ * position `pos`, in at most two blocks (before and after the wrap). */
+static void ring_copy_in(size_t pos, const int16_t *src, size_t count)
+{
+   const size_t first = std::min(count, RING_FRAMES - pos);
+   memcpy(&g_ring[pos * 2], src, first * 2 * sizeof(int16_t));
+   memcpy(&g_ring[0], src + first * 2, (count - first) * 2 * sizeof(int16_t));
+}
+
+static void ring_copy_out(size_t pos, int16_t *dst, size_t count)
+{
+   const size_t first = std::min(count, RING_FRAMES - pos);
+   memcpy(dst, &g_ring[pos * 2], first * 2 * sizeof(int16_t));
+   memcpy(dst + first * 2, &g_ring[0], (count - first) * 2 * sizeof(int16_t));
+}
+
+/* Appends frames; when the ring is full, the oldest frames are dropped. */
 static void ring_write(const int16_t *frames, size_t count)
 {
    std::lock_guard<std::mutex> lock(g_ring_mutex);
 
-   for (size_t i = 0; i < count; i++)
+   if (count > RING_FRAMES)
    {
-      if (g_ring_count == RING_FRAMES)
-      {
-         /* Full: drop the oldest frame. */
-         g_ring_read = (g_ring_read + 1) % RING_FRAMES;
-         g_ring_count--;
-      }
-      const size_t pos = (g_ring_read + g_ring_count) % RING_FRAMES;
-      g_ring[pos * 2]     = frames[i * 2];
-      g_ring[pos * 2 + 1] = frames[i * 2 + 1];
-      g_ring_count++;
+      frames += (count - RING_FRAMES) * 2;
+      count   = RING_FRAMES;
    }
+   if (g_ring_count + count > RING_FRAMES)
+   {
+      const size_t drop = g_ring_count + count - RING_FRAMES;
+      g_ring_read   = (g_ring_read + drop) % RING_FRAMES;
+      g_ring_count -= drop;
+   }
+
+   ring_copy_in((g_ring_read + g_ring_count) % RING_FRAMES, frames, count);
+   g_ring_count += count;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -422,12 +440,7 @@ extern "C" size_t audio_read(int16_t *dst, size_t frames)
    std::lock_guard<std::mutex> lock(g_ring_mutex);
    const size_t count = frames < g_ring_count ? frames : g_ring_count;
 
-   for (size_t i = 0; i < count; i++)
-   {
-      const size_t pos = (g_ring_read + i) % RING_FRAMES;
-      dst[i * 2]     = g_ring[pos * 2];
-      dst[i * 2 + 1] = g_ring[pos * 2 + 1];
-   }
+   ring_copy_out(g_ring_read, dst, count);
    g_ring_read   = (g_ring_read + count) % RING_FRAMES;
    g_ring_count -= count;
    return count;

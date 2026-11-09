@@ -118,6 +118,21 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+## Source layout
+
+| File | Role |
+|------|------|
+| `src/video_capture_libretro.c` | libretro entry points; device selection; frame pacing, frame rate measurement, pause detection; output (crop, scaling, conversion); capture stats |
+| `src/options.c` | Core options: one table describes every option, from which both the v2 and the legacy formats are built; current values; the lists of devices and audio inputs |
+| `src/audio_output.c` | Audio sent to RetroArch: audio input selection (including Auto), buffering and drift compensation |
+| `src/no_signal.c` | The No Signal screen |
+| `src/convert.c` | YUV (NV12, YUY2) to RGB conversion with crop and box-filter downscaling |
+| `src/scale.c` | Box-filter downscaling of RGB frames |
+| `src/font.c` | 8x8 bitmap font for the No Signal screen and the stats |
+| `src/capture.h`, `src/capture_mf.cpp` | Video capture interface and its Media Foundation backend (Windows); `capture_null.c` elsewhere |
+| `src/audio.h`, `src/audio_wasapi.cpp` | Audio capture interface and its WASAPI backend (Windows); `audio_null.c` elsewhere |
+| `src/core.h` | Declarations shared by the modules (frontend callbacks, logging) |
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
