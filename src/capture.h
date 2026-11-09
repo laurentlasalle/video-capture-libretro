@@ -73,9 +73,12 @@ int capture_list_devices(capture_device_t *out, int max);
 
 /* Opens the device with the given id and starts streaming.
  * With `raw_yuv`, NV12 and YUY2 frames are delivered as is, for the core to
- * convert; otherwise the backend delivers XRGB8888.
+ * convert; otherwise the backend delivers XRGB8888. With a nonzero
+ * `preferred_height`, a device format of that height is used if the device
+ * offers one (for example 720 to capture 1280x720 without the device scaling
+ * it); otherwise the largest format up to 1920x1080.
  * Returns false if the device could not be opened; see capture_last_error(). */
-bool capture_start(const char *id, bool raw_yuv);
+bool capture_start(const char *id, bool raw_yuv, unsigned preferred_height);
 
 /* Stops streaming and releases the device. Safe to call when not started. */
 void capture_stop(void);

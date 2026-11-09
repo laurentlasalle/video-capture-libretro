@@ -710,9 +710,10 @@ static void log_native_formats(IMFSourceReader *reader)
  * 2. highest frame rate,
  * 3. largest frame size,
  * 4. best format for the conversion mode (see format_rank()). */
-static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv)
+static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv, unsigned preferred_height)
 {
    IMFMediaType *best = nullptr;
+   bool best_matches = false;
    bool best_fits = false;
    unsigned best_fps = 0;
    UINT64 best_area = 0;
@@ -736,12 +737,14 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv)
 
       const unsigned fps = rate_den ? (unsigned)((double)rate_num / rate_den + 0.5) : 0;
       const UINT64 area  = (UINT64)width * height;
+      const bool matches = preferred_height && height == preferred_height;
       const bool fits    = width <= 1920 && height <= 1080;
       const int rank     = format_rank(subtype, raw_yuv);
 
       bool better;
-      if (!best)                  better = true;
-      else if (fits != best_fits) better = fits;
+      if (!best)                        better = true;
+      else if (matches != best_matches) better = matches;
+      else if (fits != best_fits)       better = fits;
       else if (fps != best_fps)   better = fps > best_fps;
       else if (area != best_area) better = area > best_area;
       else                        better = rank > best_rank;
@@ -749,8 +752,9 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv)
       if (better)
       {
          safe_release(&best);
-         best      = type;
-         best_fits = fits;
+         best         = type;
+         best_matches = matches;
+         best_fits    = fits;
          best_fps  = fps;
          best_area = area;
          best_rank = rank;
@@ -759,6 +763,9 @@ static IMFMediaType *select_native_type(IMFSourceReader *reader, bool raw_yuv)
          safe_release(&type);
    }
 
+   if (best && preferred_height && !best_matches)
+      log_message(CAPTURE_LOG_WARN, "The device offers no format with %u lines; using the largest one up to 1080p.",
+            preferred_height);
    return best;
 }
 
@@ -905,7 +912,7 @@ extern "C" int capture_list_devices(capture_device_t *out, int max)
    return found;
 }
 
-extern "C" bool capture_start(const char *id, bool raw_yuv)
+extern "C" bool capture_start(const char *id, bool raw_yuv, unsigned preferred_height)
 {
    IMFAttributes *source_attributes = nullptr;
    IMFAttributes *reader_attributes = nullptr;
@@ -967,7 +974,7 @@ extern "C" bool capture_start(const char *id, bool raw_yuv)
 
    /* Pick and apply the device's native format. */
    log_native_formats(g_reader);
-   native_type = select_native_type(g_reader, raw_yuv);
+   native_type = select_native_type(g_reader, raw_yuv, preferred_height);
    if (!native_type)
    {
       set_last_error("The device reports no usable video format.");

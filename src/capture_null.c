@@ -20,10 +20,11 @@ int capture_list_devices(capture_device_t *out, int max)
    return 0;
 }
 
-bool capture_start(const char *id, bool raw_yuv)
+bool capture_start(const char *id, bool raw_yuv, unsigned preferred_height)
 {
    (void)id;
    (void)raw_yuv;
+   (void)preferred_height;
    return false;
 }
 

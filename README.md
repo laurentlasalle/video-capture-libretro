@@ -4,7 +4,7 @@ A [libretro](https://www.libretro.com/) core that displays a live video capture 
 
 It works like OBS Studio's *Video Capture Device* source, but the image goes through RetroArch's shader pipeline instead.
 
-> **Status: experimental.** Video capture works on Windows. Audio is not captured yet.
+> **Status: experimental.** Video and audio capture work on Windows.
 
 ## Why
 
@@ -21,11 +21,13 @@ Close OBS or any other application using the device first: most capture devices 
 
 ## Core options
 
-**Capture Device** is on the main page of **Quick Menu > Core Options**; the other options are grouped in three submenus: **Video** (Output Resolution, Aspect Ratio, Crop Horizontal, Crop Vertical, Frame Pacing), **Color** (Color Conversion, Color Space, Color Range) and **Diagnostics** (Show Capture Stats, Log Capture Stats, No Signal Details).
+**Capture Device** and **Audio Input** are on the main page of **Quick Menu > Core Options**; the other options are grouped in three submenus: **Video** (Capture Resolution, Output Resolution, Aspect Ratio, Crop Horizontal, Crop Vertical, Frame Pacing), **Color** (Color Conversion, Color Space, Color Range) and **Diagnostics** (Show Capture Stats, Log Capture Stats, No Signal Details).
 
 | Option | Values | Description |
 |--------|--------|-------------|
 | Capture Device | Auto, detected devices | Device to display. Auto selects the first device found. Devices are detected when the core starts. |
+| Audio Input | Off, Auto, detected inputs | Audio played with the picture, for example the audio of the HDMI capture device. *Auto* picks the input whose name contains the capture device's name. Leave it off if the audio already reaches your speakers another way, for example through a mixer. See [Audio](#audio). |
+| Capture Resolution | Auto, 1080p, 720p, 576p, 480p | Resolution requested from the device. *Auto* uses the largest one up to 1080p. Choosing the source's resolution, for example 720p for a 720p console, avoids the device scaling the picture, which keeps pixel-perfect sources sharp. If the device does not offer it, Auto is used. |
 | Output Resolution | Native, 640x480, 320x240 | Size of the image passed to the shaders. CRT and VHS shaders expect a low resolution. Downscaling averages the source pixels to avoid aliasing. |
 | Aspect Ratio | Source, 4:3 (Squash), 4:3 (Crop Pillarbox), 16:9 | Display aspect ratio. *Squash* keeps the whole frame, for a 4:3 picture stretched to 16:9. *Crop Pillarbox* keeps only the central 4:3 area, for a picture with black bars on the sides. Applies to the area left by the crop options. |
 | Crop Horizontal | Off, 4 to 504 px | Pixels removed on the left and on the right of the captured image, for example the black borders around a pixel-perfect picture. Applied before Aspect Ratio and Output Resolution. |
@@ -92,13 +94,19 @@ The core writes the device's formats, the selected format and any errors to Retr
 | Linux | Builds; capture not implemented yet (see RetroArch's Video Processor core for V4L2) |
 | macOS | Not planned yet |
 
+## Audio
+
+With **Audio Input** set, the core captures that input (WASAPI, shared mode) and sends it to RetroArch with the picture. It keeps about 33 ms of audio buffered (2 frames) and resamples it by up to 0.5%, inaudibly, to follow RetroArch, whose clock differs slightly from the capture device's. After a pause, the core drops the audio received meanwhile, so sound and picture stay in sync.
+
+Windows may also play the same input through **Listen to this device** (Sound settings > the input's properties); turn that off to avoid hearing it twice. Session summaries in the stats log count audio underruns (the buffer ran dry) and resyncs (excess audio dropped, usually after a pause).
+
 ## Roadmap
 
 - [x] Video capture with device selection
 - [x] Output resolution and aspect ratio options
 - [x] Color conversion in the core, Rec. 601/709, limited/full range
 - [x] No Signal screen, capture stats, `.vidcap` files
-- [ ] Audio capture, with dynamic resampling to compensate for clock drift
+- [x] Audio capture, with dynamic resampling to compensate for clock drift
 - [ ] First release
 
 ## Building

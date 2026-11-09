@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@
 
 #include "libretro.h"
 #include "capture.h"
+#include "audio.h"
 #include "convert.h"
 #include "font.h"
 #include "scale.h"
@@ -74,6 +76,10 @@
 #define OPTION_PACING      "video_capture_frame_pacing"
 #define OPTION_STATS_LOG   "video_capture_stats_log"
 #define OPTION_CROP_H      "video_capture_crop_horizontal"
+#define OPTION_CAPTURE_RES "video_capture_capture_resolution"
+#define OPTION_AUDIO       "video_capture_audio_device"
+#define AUDIO_OFF          "off"
+#define AUDIO_AUTO         "auto"
 #define OPTION_CROP_V      "video_capture_crop_vertical"
 
 /* Crop options: pixels removed on each side. Horizontal steps are larger to
@@ -115,6 +121,7 @@ enum stats_mode
 /* Current option values */
 static enum output_resolution  opt_resolution  = RESOLUTION_NATIVE;
 static enum aspect_mode        opt_aspect      = ASPECT_SOURCE;
+static unsigned                opt_capture_height; /* Preferred device format height, 0 for Auto */
 static unsigned                opt_crop_h;      /* Pixels removed on the left and on the right */
 static unsigned                opt_crop_v;      /* Pixels removed at the top and at the bottom */
 static bool                    opt_core_convert = true;
@@ -147,6 +154,7 @@ static int              device_count;
 static char             active_device_id[sizeof(devices[0].id)];
 static const char      *active_device_name = "";
 static bool             active_core_convert; /* Conversion mode the device was opened with */
+static unsigned         active_capture_height; /* Preferred format height the device was opened with */
 static double           retry_timer;         /* Seconds until the next reopen attempt */
 
 /* Why the No Signal screen is shown, if it is. */
@@ -182,6 +190,18 @@ static double          output_fps    = DEFAULT_FPS;
 /* Audio */
 static int16_t silence[AUDIO_FRAMES_MAX * 2];
 static double  audio_frames_pending; /* Fractional audio frames carried between video frames */
+
+/* Audio capture (see output_audio()). */
+#define AUDIO_TARGET_FRAMES 1600   /* Buffered input kept ahead of the output: about 33 ms at 48 kHz */
+#define AUDIO_MAX_ADJUST    0.005  /* Largest resampling correction, +/- 0.5% (inaudible) */
+static char     active_audio_id[sizeof(((audio_device_t *)0)->id)];
+static double   audio_retry_timer;
+static bool     audio_buffering = true; /* Waiting for AUDIO_TARGET_FRAMES before playing */
+static double   audio_in_pending;       /* Fractional input frames carried between video frames */
+static int16_t  audio_in[AUDIO_FRAMES_MAX * 4 * 2];
+static int16_t  audio_out[AUDIO_FRAMES_MAX * 2];
+static uint64_t session_audio_underruns;
+static uint64_t session_audio_resyncs;
 
 /* Stats */
 static retro_time_t stats_last_time;
@@ -255,10 +275,16 @@ static uint32_t     stats_colors[STATS_LINES];
 
 /* Core option storage. Device names are used as option values. */
 static char option_device_names[CAPTURE_MAX_DEVICES][sizeof(devices[0].name) + 16];
-static struct retro_core_option_v2_definition option_definitions[13];
+static struct retro_core_option_v2_definition option_definitions[15];
 static struct retro_core_option_v2_category   option_categories[4];
 static char legacy_device_values[CAPTURE_MAX_DEVICES * (sizeof(devices[0].name) + 17) + 64];
-static struct retro_variable legacy_variables[13];
+static struct retro_variable legacy_variables[15];
+
+/* Audio inputs, named like the capture devices. */
+static audio_device_t audio_devices[AUDIO_MAX_DEVICES];
+static int            audio_device_count;
+static char           option_audio_names[AUDIO_MAX_DEVICES][sizeof(audio_devices[0].name) + 16];
+static char           legacy_audio_values[AUDIO_MAX_DEVICES * (sizeof(audio_devices[0].name) + 17) + 64];
 
 /* Crop option values and labels, built at startup ("0" / "Off", "4" / "4 px"). */
 static char        crop_text[2][CROP_VALUES][2][12];
@@ -383,6 +409,26 @@ static void refresh_device_list(void)
    log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d capture device(s) found.\n", device_count);
    for (i = 0; i < device_count; i++)
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_device_names[i]);
+
+   audio_device_count = audio_list_devices(audio_devices, AUDIO_MAX_DEVICES);
+   for (i = 0; i < audio_device_count; i++)
+   {
+      int duplicates = 0;
+
+      for (j = 0; j < i; j++)
+         if (strcmp(audio_devices[i].name, audio_devices[j].name) == 0)
+            duplicates++;
+
+      if (duplicates)
+         snprintf(option_audio_names[i], sizeof(option_audio_names[i]), "%.255s #%d",
+               audio_devices[i].name, duplicates + 1);
+      else
+         snprintf(option_audio_names[i], sizeof(option_audio_names[i]), "%.255s", audio_devices[i].name);
+   }
+
+   log_cb(RETRO_LOG_INFO, LOG_PREFIX "%d audio input(s) found.\n", audio_device_count);
+   for (i = 0; i < audio_device_count; i++)
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "  %s\n", option_audio_names[i]);
 }
 
 /* Fills one option definition. `values` alternates value and label (NULL
@@ -414,6 +460,9 @@ static const char *const aspect_values[] = {
 };
 static const char *const conversion_values[] = {
    "core", "Core", "media_foundation", "Media Foundation", NULL
+};
+static const char *const capture_res_values[] = {
+   "auto", "Auto (up to 1080p)", "1080", "1080p", "720", "720p", "576", "576p", "480", "480p", NULL
 };
 static const char *const color_space_values[] = {
    "default", "Default", "rec709", "Rec. 709", "rec601", "Rec. 601", NULL
@@ -509,6 +558,28 @@ static void declare_core_options(void)
          def->values[i + 1].value = option_device_names[i];
       def->default_value = DEVICE_AUTO;
       def++;
+
+      def->key  = OPTION_AUDIO;
+      def->desc = "Audio Input";
+      def->info = "Audio input played with the picture, for example the audio of the HDMI capture device. "
+                  "Auto picks the input whose name contains the capture device's name. "
+                  "Leave it off if the audio already reaches your speakers another way, for example through a mixer. "
+                  "Inputs are detected when the core starts.";
+      def->values[0].value = AUDIO_OFF;
+      def->values[0].label = "Off";
+      def->values[1].value = AUDIO_AUTO;
+      def->values[1].label = "Auto (match capture device)";
+      for (i = 0; i < audio_device_count && i < RETRO_NUM_CORE_OPTION_VALUES_MAX - 3; i++)
+         def->values[i + 2].value = option_audio_names[i];
+      def->default_value = AUDIO_OFF;
+      def++;
+
+      define_option(def++, "video", OPTION_CAPTURE_RES, "Capture Resolution",
+            "Resolution requested from the capture device. Auto uses the largest one up to 1080p. "
+            "Choose the resolution of the source, for example 720p for a 720p console, if the device "
+            "offers it: the device then does not scale the picture, which keeps pixel-perfect sources sharp. "
+            "If the device does not offer it, Auto is used. Changing this option reopens the device.",
+            "auto", capture_res_values);
 
       define_option(def++, "video", OPTION_RESOLUTION, "Output Resolution",
             "Resolution of the image passed to RetroArch and its shaders. "
@@ -622,8 +693,20 @@ static void declare_core_options(void)
       legacy_variables[10].value = legacy_crop_option(0, "Crop Horizontal");
       legacy_variables[11].key   = OPTION_CROP_V;
       legacy_variables[11].value = legacy_crop_option(1, "Crop Vertical");
-      legacy_variables[12].key   = NULL;
-      legacy_variables[12].value = NULL;
+      legacy_variables[12].key   = OPTION_CAPTURE_RES;
+      legacy_variables[12].value = "Capture Resolution; auto|1080|720|576|480";
+      {
+         size_t audio_len = (size_t)snprintf(legacy_audio_values, sizeof(legacy_audio_values),
+               "Audio Input; %s|%s", AUDIO_OFF, AUDIO_AUTO);
+
+         for (i = 0; i < audio_device_count && audio_len < sizeof(legacy_audio_values); i++)
+            audio_len += (size_t)snprintf(legacy_audio_values + audio_len, sizeof(legacy_audio_values) - audio_len,
+                  "|%s", option_audio_names[i]);
+      }
+      legacy_variables[13].key   = OPTION_AUDIO;
+      legacy_variables[13].value = legacy_audio_values;
+      legacy_variables[14].key   = NULL;
+      legacy_variables[14].value = NULL;
       environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, legacy_variables);
    }
 }
@@ -728,6 +811,9 @@ static void read_options(void)
               : option_is(value, "16_9")       ? ASPECT_16_9
               : ASPECT_SOURCE;
 
+   value = get_option(OPTION_CAPTURE_RES);
+   opt_capture_height = value && !option_is(value, "auto") ? (unsigned)strtoul(value, NULL, 10) : 0;
+
    value = get_option(OPTION_CROP_H);
    opt_crop_h = value ? (unsigned)strtoul(value, NULL, 10) & ~1u : 0;
    value = get_option(OPTION_CROP_V);
@@ -803,6 +889,9 @@ static void log_session_stats(void)
          seconds, paused, received / seconds, session_runs / seconds, session_frames_shown / seconds,
          (unsigned long long)session_dropped, (unsigned long long)session_pacing_skips,
          (unsigned long long)session_repeated);
+   if (active_audio_id[0])
+      stats_log_printf("Audio: %llu underrun(s), %llu resync(s).",
+            (unsigned long long)session_audio_underruns, (unsigned long long)session_audio_resyncs);
 }
 
 static void reset_session_stats(void)
@@ -815,6 +904,8 @@ static void reset_session_stats(void)
    session_repeated      = 0;
    session_paused_usec   = 0;
    session_paused_frames = 0;
+   session_audio_underruns = 0;
+   session_audio_resyncs   = 0;
 }
 
 static void restart_stats_second(retro_time_t end);
@@ -833,12 +924,13 @@ static void apply_device_selection(bool force)
    }
 
    if (!force && strcmp(devices[index].id, active_device_id) == 0 &&
-       active_core_convert == opt_core_convert)
+       active_core_convert == opt_core_convert && active_capture_height == opt_capture_height)
       return;
 
    snprintf(active_device_id, sizeof(active_device_id), "%s", devices[index].id);
    active_device_name    = option_device_names[index];
    active_core_convert   = opt_core_convert;
+   active_capture_height = opt_capture_height;
    have_frame            = false;
    seconds_without_frame = 0.0;
    seconds_black         = 0.0;
@@ -854,7 +946,7 @@ static void apply_device_selection(bool force)
    rate_nominal         = 0.0;
    rate_candidate       = 0.0;
 
-   if (capture_start(devices[index].id, opt_core_convert))
+   if (capture_start(devices[index].id, opt_core_convert, opt_capture_height))
       log_cb(RETRO_LOG_INFO, LOG_PREFIX "Capture started: %s.\n", active_device_name);
    else
       log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start capture: %s\n", capture_last_error());
@@ -866,6 +958,167 @@ static void apply_device_selection(bool force)
    waiting_first_run = true;
 
    stats_lines[0][0]   = '\0';
+}
+
+/* True if `text` contains `part`, ignoring ASCII case. */
+static bool contains_ignoring_case(const char *text, const char *part)
+{
+   size_t i, j;
+
+   if (!part[0])
+      return false;
+   for (i = 0; text[i]; i++)
+   {
+      for (j = 0; part[j] && text[i + j]; j++)
+         if (tolower((unsigned char)text[i + j]) != tolower((unsigned char)part[j]))
+            break;
+      if (!part[j])
+         return true;
+   }
+   return false;
+}
+
+/* Opens the audio input selected in the core options. Auto picks the first
+ * input whose name contains the capture device's name, such as "Digital Audio
+ * Interface (Cam Link Pro HDMI-4)" for "Cam Link Pro HDMI-4". Without
+ * `force`, nothing happens if that input is already open. */
+static void apply_audio_selection(bool force)
+{
+   const char *value = get_option(OPTION_AUDIO);
+   const bool auto_select = option_is(value, AUDIO_AUTO);
+   int index = -1, i;
+
+   if (auto_select)
+   {
+      for (i = 0; i < audio_device_count && index < 0; i++)
+         if (contains_ignoring_case(audio_devices[i].name, active_device_name))
+            index = i;
+   }
+   else if (value && !option_is(value, AUDIO_OFF))
+   {
+      for (i = 0; i < audio_device_count && index < 0; i++)
+         if (strcmp(option_audio_names[i], value) == 0)
+            index = i;
+   }
+
+   if (!force && strcmp(index >= 0 ? audio_devices[index].id : "", active_audio_id) == 0)
+      return;
+
+   audio_stop();
+   snprintf(active_audio_id, sizeof(active_audio_id), "%s", index >= 0 ? audio_devices[index].id : "");
+   audio_buffering   = true;
+   audio_in_pending  = 0.0;
+   audio_retry_timer = RETRY_INTERVAL;
+
+   if (index < 0)
+   {
+      if (auto_select)
+      {
+         log_cb(RETRO_LOG_WARN, LOG_PREFIX "No audio input name contains \"%s\"; select one in Audio Input.\n",
+               active_device_name);
+         stats_log_printf("Audio: no input name contains \"%s\".", active_device_name);
+      }
+      return;
+   }
+
+   if (audio_start(audio_devices[index].id))
+   {
+      log_cb(RETRO_LOG_INFO, LOG_PREFIX "Audio started: %s (%u Hz).\n", option_audio_names[index],
+            audio_sample_rate());
+      stats_log_printf("Audio started: %s (%u Hz).", option_audio_names[index], audio_sample_rate());
+   }
+   else
+   {
+      log_cb(RETRO_LOG_ERROR, LOG_PREFIX "Could not start audio: %s.\n", option_audio_names[index]);
+      stats_log_printf("Could not start audio: %s.", option_audio_names[index]);
+   }
+}
+
+/* Linear interpolation of `in_frames` stereo frames into `out_frames`. */
+static void resample_linear(const int16_t *in, size_t in_frames, int16_t *out, size_t out_frames)
+{
+   size_t i;
+
+   for (i = 0; i < out_frames; i++)
+   {
+      const double pos  = (double)i * (double)in_frames / (double)out_frames;
+      const size_t a    = (size_t)pos;
+      const size_t b    = a + 1 < in_frames ? a + 1 : a;
+      const double frac = pos - (double)a;
+
+      out[i * 2]     = (int16_t)(in[a * 2] + (in[b * 2] - in[a * 2]) * frac);
+      out[i * 2 + 1] = (int16_t)(in[a * 2 + 1] + (in[b * 2 + 1] - in[a * 2 + 1]) * frac);
+   }
+}
+
+/*
+ * Sends `frames` stereo frames at SAMPLE_RATE to the frontend: captured audio
+ * if an input is open, silence otherwise.
+ *
+ * The input runs on the capture device's clock and RetroArch on the computer's,
+ * so the amount of buffered input slowly drifts. The core keeps about
+ * AUDIO_TARGET_FRAMES buffered: it reads slightly more or less input than it
+ * outputs (up to AUDIO_MAX_ADJUST), and resamples it to the output length.
+ * After a pause, when the buffer holds far too much, the excess is dropped;
+ * when it runs dry, the core waits for the target again, outputting silence.
+ */
+static void output_audio(size_t frames)
+{
+   const double base   = (double)audio_sample_rate() / SAMPLE_RATE;
+   const double target = AUDIO_TARGET_FRAMES * base;
+   size_t level, in_frames, got;
+   double adjust;
+
+   if (!active_audio_id[0] || !audio_is_running())
+   {
+      audio_buffering = true;
+      audio_batch_cb(silence, frames);
+      return;
+   }
+
+   level = audio_available();
+
+   if (audio_buffering)
+   {
+      if ((double)level < target)
+      {
+         audio_batch_cb(silence, frames);
+         return;
+      }
+      audio_buffering = false;
+   }
+
+   /* Far too much buffered (after a pause): drop the excess. */
+   if ((double)level > target * 3.0 + frames * base)
+   {
+      audio_discard(level - (size_t)target);
+      level = (size_t)target;
+      session_audio_resyncs++;
+   }
+
+   adjust = AUDIO_MAX_ADJUST * ((double)level - target) / target;
+   if (adjust > AUDIO_MAX_ADJUST)  adjust = AUDIO_MAX_ADJUST;
+   if (adjust < -AUDIO_MAX_ADJUST) adjust = -AUDIO_MAX_ADJUST;
+
+   audio_in_pending += (double)frames * base * (1.0 + adjust);
+   in_frames = (size_t)audio_in_pending;
+   if (in_frames > sizeof(audio_in) / sizeof(audio_in[0]) / 2)
+      in_frames = sizeof(audio_in) / sizeof(audio_in[0]) / 2;
+   if (in_frames == 0)
+      in_frames = 1;
+   audio_in_pending -= (double)in_frames;
+
+   got = audio_read(audio_in, in_frames);
+   if (got < in_frames)
+   {
+      /* Ran dry: pad with silence and wait for the target again. */
+      memset(audio_in + got * 2, 0, (in_frames - got) * 2 * sizeof(int16_t));
+      audio_buffering = true;
+      session_audio_underruns++;
+   }
+
+   resample_linear(audio_in, in_frames, audio_out, frames);
+   audio_batch_cb(audio_out, frames);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1684,6 +1937,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
       log_cb = fallback_log;
 
    capture_set_logger(capture_logger);
+   audio_set_logger(capture_logger);
 
    /* The core starts without content ("Start Core") or with a .vidcap file. */
    environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);
@@ -1707,6 +1961,7 @@ RETRO_API void retro_init(void)
 RETRO_API void retro_deinit(void)
 {
    capture_stop();
+   audio_stop();
    if (stats_log_file)
    {
       fclose(stats_log_file);
@@ -1748,6 +2003,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 RETRO_API void retro_reset(void)
 {
    apply_device_selection(true);
+   apply_audio_selection(true);
 }
 
 /* Detects pauses (RetroArch's menu, shader setup) from the time since the
@@ -1802,12 +2058,21 @@ RETRO_API void retro_run(void)
       log_options(false);
       update_stats_log_file();
       apply_device_selection(false);
+      apply_audio_selection(false);
       screen_key[0] = '\0';
    }
 
    present_frame(updated);
 
-   /* Silent audio matching the frame rate (800.8 frames per video frame at 59.94 fps). */
+   /* Audio input lost (device unplugged): retry periodically. */
+   if (active_audio_id[0] && !audio_is_running())
+   {
+      audio_retry_timer -= 1.0 / output_fps;
+      if (audio_retry_timer <= 0.0)
+         apply_audio_selection(true);
+   }
+
+   /* Audio matching the frame rate (800.8 frames per video frame at 59.94 fps). */
    if (audio_batch_cb)
    {
       size_t frames;
@@ -1820,7 +2085,7 @@ RETRO_API void retro_run(void)
       if (audio_frames_pending > AUDIO_FRAMES_MAX)
          audio_frames_pending = 0.0;
 
-      audio_batch_cb(silence, frames);
+      output_audio(frames);
    }
 }
 
@@ -1850,6 +2115,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    update_stats_log_file();
    active_device_id[0] = '\0';
    apply_device_selection(true);
+   active_audio_id[0] = '\0';
+   apply_audio_selection(true);
 
    /* retro_get_system_av_info() is called after this: report the device rate directly. */
    output_fps = valid_fps(capture_get_frame_rate());
@@ -1869,6 +2136,8 @@ RETRO_API void retro_unload_game(void)
    restart_stats_second(perf_cb.get_time_usec ? perf_cb.get_time_usec() : 0);
    log_session_stats();
    capture_stop();
+   audio_stop();
+   active_audio_id[0]  = '\0';
    active_device_id[0] = '\0';
    have_frame          = false;
 }
